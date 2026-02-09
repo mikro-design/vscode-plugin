@@ -1,0 +1,16 @@
+{
+  "mikroDesign.sdkPath": "/home/veba/work/gitlab/onio.firmware.c",
+  "mikroDesign.appName": "while_one",
+  "mikroDesign.configName": "pegasus_v3_bringup",
+  "mikroDesign.toolchain": "GNU",
+  "mikroDesign.buildOnDebug": false,
+  "mikroDesign.debugStopAtEntry": true,
+  "mikroDesign.elfPath": "/home/veba/work/gitlab/onio.firmware.c/build/while_one/pegasus_v3_bringup/GNU/while_one.elf",
+  "mikroDesign.rv32simPath": "/home/veba/work/git/rv32sim/rv32sim.py",
+  "mikroDesign.svdPath": "/home/veba/work/git/rv32sim/examples/example_device.svd",
+  "mikroDesign.assertMode": "assist",
+  "mikroDesign.assertWrites": false,
+  "mikroDesign.gdbPath": "/home/veba/work/git/riscv-gnu-toolchain/install/bin/riscv32-unknown-elf-gdb",
+  "mikroDesign.addr2linePath": "/home/veba/work/git/riscv-gnu-toolchain/install/bin/riscv32-unknown-elf-addr2line",
+  "mikroDesign.toolchainBin": "/opt/riscv32imc-bitext/2023-11-21-8e9fb09a/bin"
+}

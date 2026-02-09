@@ -1,0 +1,422 @@
+{
+  "name": "mikro-design-vscode",
+  "displayName": "Mikro Design",
+  "description": "SVD register map and rv32sim debug assist",
+  "version": "0.0.1",
+  "publisher": "mikro",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:mikroDesign.selectSvd",
+    "onCommand:mikroDesign.refreshSvd",
+    "onCommand:mikroDesign.startSim",
+    "onCommand:mikroDesign.stopSim",
+    "onCommand:mikroDesign.forceDockAssertViews",
+    "onCommand:mikroDesign.attachGdb",
+    "onCommand:mikroDesign.loadElfViaGdb",
+    "onCommand:mikroDesign.setupProject",
+    "onView:mikroDesign.registerMap",
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:asm",
+    "onLanguage:s"
+  ],
+  "main": "./out/extension.js",
+  "extensionKind": [
+    "ui"
+  ],
+  "contributes": {
+    "debuggers": [
+      {
+        "type": "mikroDesign",
+        "label": "Mikro: rv32sim",
+        "program": "./out/rv32simDebugAdapter.js",
+        "runtime": "node",
+        "languages": [
+          "c",
+          "cpp",
+          "asm",
+          "s"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "ELF file to debug."
+              },
+              "gdbPath": {
+                "type": "string",
+                "description": "GDB executable for RISC-V."
+              },
+              "miDebuggerServerAddress": {
+                "type": "string",
+                "description": "GDB server address (host:port)."
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "default": true,
+                "description": "Stop at entry."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "name": "Mikro: rv32sim",
+            "type": "mikroDesign",
+            "request": "launch",
+            "program": "${workspaceFolder}/path/to.elf",
+            "stopAtEntry": true
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "mikroDesign.assert.clearTrace",
+        "title": "Mikro: Clear Assert Trace"
+      },
+      {
+        "command": "mikroDesign.selectAssertFile",
+        "title": "Mikro: Select Assert File"
+      },
+      {
+        "command": "mikroDesign.createAssertFile",
+        "title": "Mikro: Create Assert File"
+      },
+      {
+        "command": "mikroDesign.setupProject",
+        "title": "Mikro: Setup Project (SDK)"
+      },
+      {
+        "command": "mikroDesign.assert.showTrace",
+        "title": "Mikro: Show Assert Trace"
+      },
+      {
+        "command": "mikroDesign.detectToolchain",
+        "title": "Mikro: Detect Toolchain"
+      },
+      {
+        "command": "mikroDesign.selectSvd",
+        "title": "Mikro: Select SVD File"
+      },
+      {
+        "command": "mikroDesign.refreshSvd",
+        "title": "Mikro: Refresh SVD View"
+      },
+      {
+        "command": "mikroDesign.startSim",
+        "title": "Mikro: Start rv32sim"
+      },
+      {
+        "command": "mikroDesign.buildFirmware",
+        "title": "Mikro: Build Firmware (SDK)"
+      },
+      {
+        "command": "mikroDesign.debug",
+        "title": "Mikro: Debug (rv32sim)"
+      },
+      {
+        "command": "mikroDesign.debug.smartContinue",
+        "title": "Mikro: Continue Debug (safe)"
+      },
+      {
+        "command": "mikroDesign.stopSim",
+        "title": "Mikro: Stop rv32sim"
+      },
+      {
+        "command": "mikroDesign.attachGdb",
+        "title": "Mikro: Attach GDB to rv32sim"
+      },
+      {
+        "command": "mikroDesign.loadElfViaGdb",
+        "title": "Mikro: Load ELF via GDB (monitor load_elf)"
+      },
+      {
+        "command": "mikroDesign.assert.pickChoice",
+        "title": "Mikro: Choose Assert Value"
+      },
+      {
+        "command": "mikroDesign.assert.sendChoice",
+        "title": "Mikro: Send Assert Choice"
+      },
+      {
+        "command": "mikroDesign.assert.ignore",
+        "title": "Mikro: Ignore Assert Access"
+      },
+      {
+        "command": "mikroDesign.assert.default",
+        "title": "Mikro: Use Default Assert Value"
+      },
+      {
+        "command": "mikroDesign.forceDockAssertViews",
+        "title": "Mikro: Force Dock Assert Views"
+      }
+    ],
+    "views": {
+      "debug": [
+        {
+          "id": "mikroDesign.registerMap",
+          "name": "SVD Register Map"
+        },
+        {
+          "id": "mikroDesign.assertHelper",
+          "name": "MMIO Assert Helper",
+          "type": "webview",
+          "visibility": "visible"
+        },
+        {
+          "id": "mikroDesign.assertTrace",
+          "name": "Assert Trace",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "mikroDesign.refreshSvd",
+          "when": "view == mikroDesign.registerMap",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "mikroDesign.debug.smartContinue",
+        "key": "f5",
+        "when": "mikroDesignSessionActive"
+      }
+    ],
+    "viewsWelcome": [
+      {
+        "view": "mikroDesign.registerMap",
+        "contents": "Select an SVD file with the command: **Mikro: Select SVD File**"
+      }
+    ],
+    "configuration": {
+      "title": "Mikro Design",
+      "properties": {
+        "mikroDesign.sdkPath": {
+          "type": "string",
+          "default": "/home/veba/work/gitlab/onio.firmware.c",
+          "description": "Path to the ONiO firmware SDK root."
+        },
+        "mikroDesign.appName": {
+          "type": "string",
+          "default": "",
+          "description": "App folder under <sdk>/app to build."
+        },
+        "mikroDesign.configName": {
+          "type": "string",
+          "default": "",
+          "description": "Config name (config-<name>.mk) for the selected app."
+        },
+        "mikroDesign.toolchain": {
+          "type": "string",
+          "default": "",
+          "description": "Toolchain override (defaults to app Makefile DEFAULT_TOOLCHAIN)."
+        },
+        "mikroDesign.toolchainBin": {
+          "type": "string",
+          "default": "",
+          "description": "Directory containing riscv32-unknown-elf-* toolchain binaries."
+        },
+        "mikroDesign.target": {
+          "type": "string",
+          "default": "",
+          "description": "Derived target from selected config (parsed from config-<name>.mk)."
+        },
+        "mikroDesign.debugTarget": {
+          "type": "string",
+          "enum": [
+            "rv32sim",
+            "embedded"
+          ],
+          "default": "rv32sim",
+          "description": "Debug target selection: simulator or embedded hardware."
+        },
+        "mikroDesign.memRegions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra rv32sim memory regions (START:SIZE). If empty, derive from ELF."
+        },
+        "mikroDesign.clearBreakpointsOnDebug": {
+          "type": "boolean",
+          "default": true,
+          "description": "Remove breakpoints outside the current workspace when starting a Mikro debug session."
+        },
+        "mikroDesign.pauseOnAssert": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pause the debug session when an assert prompt arrives."
+        },
+        "mikroDesign.resumeOnAssertResponse": {
+          "type": "boolean",
+          "default": false,
+          "description": "Resume execution automatically after responding to an assert prompt."
+        },
+        "mikroDesign.rv32simPath": {
+          "type": "string",
+          "default": "../rv32sim/rv32sim.py",
+          "description": "Path to rv32sim.py (relative to workspace or absolute)."
+        },
+        "mikroDesign.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python executable to run rv32sim when rv32simPath is a .py file."
+        },
+        "mikroDesign.gdbPath": {
+          "type": "string",
+          "default": "riscv32-unknown-elf-gdb",
+          "description": "GDB executable for RISC-V."
+        },
+        "mikroDesign.addr2linePath": {
+          "type": "string",
+          "default": "riscv32-unknown-elf-addr2line",
+          "description": "addr2line executable for mapping PC to source."
+        },
+        "mikroDesign.gdbPort": {
+          "type": "number",
+          "default": 3333,
+          "description": "GDB server port used by rv32sim."
+        },
+        "mikroDesign.gdbMmioReads": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow GDB memory reads to hit MMIO handlers (unsafe, enables register view values)."
+        },
+        "mikroDesign.strictMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable strict MMIO faults in rv32sim (disable to allow MMIO reads in the register view)."
+        },
+        "mikroDesign.svdPath": {
+          "type": "string",
+          "default": "../../gitlab/onio.firmware.c/chip/pegasus_v3/core/regdef.svd",
+          "description": "CMSIS-SVD file path."
+        },
+        "mikroDesign.elfPath": {
+          "type": "string",
+          "default": "",
+          "description": "Default ELF file path to load via GDB."
+        },
+        "mikroDesign.assertMode": {
+          "type": "string",
+          "enum": [
+            "none",
+            "assist",
+            "enforce"
+          ],
+          "default": "assist",
+          "description": "Assert mode for rv32sim: assist prompts, enforce uses assertion file, none disables."
+        },
+        "mikroDesign.assertFile": {
+          "type": "string",
+          "default": "",
+          "description": "Assertion JSON file used for assist or enforce mode."
+        },
+        "mikroDesign.assertPromptOnDebug": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prompt to select or create an assert file when starting rv32sim."
+        },
+        "mikroDesign.assertShowAsm": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable --assert-asm to show disassembly around MMIO accesses."
+        },
+        "mikroDesign.assertVerbose": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable --assert-verbose to show full field detail/enums."
+        },
+        "mikroDesign.assertWrites": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable --assert-writes to prompt/assert on MMIO writes."
+        },
+        "mikroDesign.assertAutoPrompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically show assert UI when an MMIO assert occurs."
+        },
+        "mikroDesign.assertShowPanel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the Assert Helper panel when an MMIO assert occurs."
+        },
+        "mikroDesign.assertAutoApplyRecommendation": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically apply the recommended assert choice when available."
+        },
+        "mikroDesign.assertTraceAutoShow": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically show the Assert Trace panel when an MMIO assert occurs."
+        },
+        "mikroDesign.assertTraceMaxEntries": {
+          "type": "number",
+          "default": 200,
+          "description": "Maximum number of entries to keep in the assert trace view."
+        },
+        "mikroDesign.buildOnDebug": {
+          "type": "boolean",
+          "default": true,
+          "description": "Build firmware before starting a debug session."
+        },
+        "mikroDesign.debugStopAtEntry": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stop at entry when starting the debug session."
+        }
+      }
+    },
+    "taskDefinitions": [
+      {
+        "type": "mikroDesign",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "Mikro SDK task name."
+          }
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "pretest:puppeteer": "npm run compile",
+    "test:puppeteer": "node ./scripts/puppeteer-test.mjs",
+    "test:adapter-chaos": "npm run -s compile && node ./scripts/adapter-chaos.mjs",
+    "test:adapter-chaos:hardcore": "npm run -s compile && MIKRO_CHAOS_ASSERT_WRITES=1 MIKRO_CHAOS_RACE_MODE=1 MIKRO_CHAOS_CYCLES=3 MIKRO_CHAOS_STEPS=80 node ./scripts/adapter-chaos.mjs"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.3.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "puppeteer-core": "^23.9.0",
+    "typescript": "^5.4.5"
+  }
+}
