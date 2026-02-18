@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as crypto from "crypto";
 import { SvdTreeProvider } from "./registerTree";
 import { AssertCodeLensProvider } from "./assertLens";
 import { AssertMode, Rv32SimController } from "./rv32simController";
@@ -21,7 +22,7 @@ import { getWorkspaceRoot, resolvePath } from "./utils";
 import { AssertPrompt } from "./assertPrompt";
 import { AssertTraceStore, AssertTracePanel, AssertLocation, AssertRecommendation as TraceRecommendation } from "./assertTrace";
 import { deriveMemRegionsFromElf } from "./memMap";
-import { configureAssertSettings } from "./assertConfig";
+import { configureAssertSettings, runAssertWizard, autoCreateAssertFileIfNeeded } from "./assertConfig";
 import { parseSvd } from "./svd";
 
 function sanitizeEnv(env: NodeJS.ProcessEnv): { [key: string]: string } {
@@ -60,7 +61,6 @@ class AssertHelperPanel implements vscode.WebviewViewProvider {
   private registers: AssertRegister[] = [];
   private messageDisposable: vscode.Disposable | null = null;
   private lastStateKey = "";
-  private revealInFlight = false;
 
   constructor(private readonly controller: Rv32SimController) {}
 
@@ -120,18 +120,9 @@ class AssertHelperPanel implements vscode.WebviewViewProvider {
       this.view.show(true);
       return;
     }
-    if (this.revealInFlight) {
-      return;
-    }
-    this.revealInFlight = true;
-    void vscode.commands.executeCommand("mikroDesign.assertHelper.focus").then(
-      () => {
-        this.revealInFlight = false;
-      },
-      () => {
-        this.revealInFlight = false;
-      }
-    );
+    // Don't use executeCommand("...focus") — it steals cursor focus from the editor.
+    // The panel will render when the user opens the sidebar manually or VS Code
+    // resolves the view. State is queued via show() and posted on resolve.
   }
 
   clear(): void {
@@ -173,7 +164,6 @@ class AssertHelperPanel implements vscode.WebviewViewProvider {
     this.registers = [];
     this.view = null;
     this.lastStateKey = "";
-    this.revealInFlight = false;
   }
 
   private buildRenderKey(): string {
@@ -204,7 +194,7 @@ class AssertHelperPanel implements vscode.WebviewViewProvider {
   }
 }
 
-function describeAssertPrompt(prompt: AssertPrompt): { title: string; placeHolder: string } {
+export function describeAssertPrompt(prompt: AssertPrompt): { title: string; placeHolder: string } {
   const title = `MMIO ${prompt.type.toUpperCase()} 0x${prompt.addr.toString(16)} size=${prompt.size} pc=0x${prompt.pc.toString(16)}`;
   const parts: string[] = [];
   if (prompt.register) {
@@ -221,7 +211,7 @@ function describeAssertPrompt(prompt: AssertPrompt): { title: string; placeHolde
   return { title, placeHolder: parts.join(" | ") };
 }
 
-function recommendAssertAction(prompt: AssertPrompt): AssertRecommendation | null {
+export function recommendAssertAction(prompt: AssertPrompt): AssertRecommendation | null {
   const hints = prompt.hints.join(" ").toLowerCase();
   if (prompt.decisions.length === 1) {
     return {
@@ -243,6 +233,31 @@ function recommendAssertAction(prompt: AssertPrompt): AssertRecommendation | nul
     return { action: "default", reason: `Reset value available (${prompt.reset}).` };
   }
   return { action: "default", reason: "Default is a safe starting point." };
+}
+
+function applyAssertRecommendation(
+  prompt: AssertPrompt | null,
+  controller: Rv32SimController
+): { applied: boolean; message: string } {
+  if (!prompt) {
+    controller.sendDefaultAssertResponse();
+    return { applied: true, message: "No active prompt; sent default fallback." };
+  }
+  const recommendation = recommendAssertAction(prompt);
+  if (!recommendation) {
+    controller.sendDefaultAssertResponse();
+    return { applied: true, message: "No recommendation; sent default value." };
+  }
+  if (recommendation.action === "decision" && recommendation.input) {
+    controller.sendAssertResponse(recommendation.input);
+    return { applied: true, message: `Applied decision ${recommendation.input}.` };
+  }
+  if (recommendation.action === "ignore") {
+    controller.sendAssertResponse("-");
+    return { applied: true, message: "Applied ignore action." };
+  }
+  controller.sendDefaultAssertResponse();
+  return { applied: true, message: "Applied default action." };
 }
 
 async function showAssertQuickPick(
@@ -289,9 +304,13 @@ async function showAssertQuickPick(
     ignoreFocusOut: true,
   });
   if (!pick) {
+    // User dismissed the QuickPick (Escape) — send default to avoid deadlocking rv32sim
+    controller.sendDefaultAssertResponse();
     return;
   }
   if (pick.action === "separator" || pick.action === "hint") {
+    // Non-actionable item selected — send default to avoid deadlocking rv32sim
+    controller.sendDefaultAssertResponse();
     return;
   }
   if (pick.action === "default") {
@@ -310,13 +329,92 @@ async function showAssertQuickPick(
 // Global cleanup state
 let globalCleanupHandlers: (() => void)[] = [];
 let mikroSelectedThreadRunning = false;
+let forcePauseInFlight = false;
+let forcePauseLastMs = 0;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   globalCleanupHandlers = [];
   mikroSelectedThreadRunning = false;
-  const output = vscode.window.createOutputChannel("rv32sim");
+  const output = vscode.window.createOutputChannel("Mikro Design");
   output.appendLine("[Mikro] Extension activated");
   appendDebugLog("Extension activated");
+  const verboseDebugUi = () => getConfig<boolean>("mikroDesign.debugUiVerbose") ?? true;
+  const debugUiLog = (message: string) => {
+    if (verboseDebugUi()) {
+      output.appendLine(`[Debug] ${message}`);
+    }
+  };
+  let adapterMirrorTimer: NodeJS.Timeout | undefined;
+  let adapterMirrorOffset = 0;
+  let adapterMirrorPath = "";
+  const stopAdapterLogMirror = () => {
+    if (adapterMirrorTimer) {
+      clearInterval(adapterMirrorTimer);
+      adapterMirrorTimer = undefined;
+    }
+  };
+  let adapterMirrorReading = false;
+  const startAdapterLogMirror = () => {
+    stopAdapterLogMirror();
+    if (!verboseDebugUi()) {
+      return;
+    }
+    // Recompute path at session start so it matches the adapter factory
+    adapterMirrorPath = path.join(getWorkspaceRoot() ?? context.extensionPath, ".mikro-adapter.log");
+    try {
+      if (!fs.existsSync(adapterMirrorPath)) {
+        fs.writeFileSync(adapterMirrorPath, "", "utf8");
+      }
+      const stat = fs.statSync(adapterMirrorPath);
+      adapterMirrorOffset = stat.size;
+      output.appendLine(`[Mikro] Adapter log mirror: ${adapterMirrorPath}`);
+    } catch (err) {
+      output.appendLine(`[Mikro] Adapter log mirror init failed: ${String(err)}`);
+      return;
+    }
+    adapterMirrorTimer = setInterval(() => {
+      if (adapterMirrorReading) {
+        return;
+      }
+      adapterMirrorReading = true;
+      void (async () => {
+        try {
+          const fh = await fs.promises.open(adapterMirrorPath, "r");
+          try {
+            const stat = await fh.stat();
+            if (stat.size < adapterMirrorOffset) {
+              adapterMirrorOffset = 0;
+            }
+            if (stat.size === adapterMirrorOffset) {
+              return;
+            }
+            const readLen = stat.size - adapterMirrorOffset;
+            const buf = Buffer.alloc(readLen);
+            const { bytesRead } = await fh.read(buf, 0, readLen, adapterMirrorOffset);
+            adapterMirrorOffset += bytesRead;
+            const text = buf.toString("utf8", 0, bytesRead).trimEnd();
+            if (!text) {
+              return;
+            }
+            for (const line of text.split(/\r?\n/)) {
+              output.appendLine(`[Adapter] ${line}`);
+            }
+          } finally {
+            await fh.close();
+          }
+        } catch {
+          // ignore transient read errors
+        } finally {
+          adapterMirrorReading = false;
+        }
+      })();
+    }, 250);
+  };
+  context.subscriptions.push({
+    dispose: () => {
+      stopAdapterLogMirror();
+    },
+  });
   void dockAssertViewsToRightSidebar();
   if (process.env.MIKRO_DEBUG_EXTENSIONS === "1") {
     const ids = vscode.extensions.all.map((ext) => ext.id).sort().join(", ");
@@ -404,7 +502,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       configured,
       sdkPath ? path.join(sdkPath, "chip", "pegasus_v3", "core", "regdef.svd") : undefined,
       workspaceRoot ? path.join(workspaceRoot, "chip", "pegasus_v3", "core", "regdef.svd") : undefined,
-      "/home/veba/work/gitlab/onio.firmware.c/chip/pegasus_v3/core/regdef.svd",
     ].filter((entry): entry is string => !!entry);
     const unique: string[] = [];
     const seen = new Set<string>();
@@ -500,15 +597,62 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const debugTrackerFactory = vscode.debug.registerDebugAdapterTrackerFactory("mikroDesign", {
     createDebugAdapterTracker(session) {
       svdTree.setDebugSession(session);
+      const actionLabel = (command: string): string => {
+        switch (command) {
+          case "launch":
+            return "Start Debugging";
+          case "continue":
+            return "Resume";
+          case "pause":
+            return "Pause";
+          case "next":
+            return "Step Over (F10)";
+          case "stepIn":
+            return "Step Into (F11)";
+          case "stepOut":
+            return "Step Out (Shift+F11)";
+          case "restart":
+            return "Restart";
+          case "terminate":
+          case "disconnect":
+            return "Stop";
+          default:
+            return command;
+        }
+      };
+      const isActionRequest = (command: string): boolean =>
+        [
+          "launch",
+          "continue",
+          "pause",
+          "next",
+          "stepIn",
+          "stepOut",
+          "restart",
+          "terminate",
+          "disconnect",
+        ].includes(command);
       return {
+        onWillReceiveMessage: (message) => {
+          if (message?.type === "request" && typeof message.command === "string") {
+            const command = message.command;
+            if (isActionRequest(command)) {
+              debugUiLog(`ui->adapter ${actionLabel(command)} request (cmd=${command}, seq=${message.seq ?? "?"})`);
+            }
+          }
+        },
         onDidSendMessage: (message) => {
           if (message?.type === "event" && message.event === "stopped") {
             mikroSelectedThreadRunning = false;
             svdTree.refreshValues(true);
+            debugUiLog(
+              `adapter->ui stopped reason=${String(message?.body?.reason ?? "unknown")} thread=${String(message?.body?.threadId ?? "?")}`
+            );
             return;
           }
           if (message?.type === "event" && message.event === "continued") {
             mikroSelectedThreadRunning = true;
+            debugUiLog(`adapter->ui continued thread=${String(message?.body?.threadId ?? "?")}`);
             return;
           }
           if (
@@ -516,10 +660,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             (message.event === "terminated" || message.event === "exited")
           ) {
             mikroSelectedThreadRunning = false;
+            debugUiLog(`adapter->ui ${message.event}`);
+            return;
           }
+          if (message?.type === "response" && typeof message.command === "string") {
+            if (isActionRequest(message.command)) {
+              const status = message.success ? "ok" : "failed";
+              const details = message.message ? ` msg=${String(message.message)}` : "";
+              debugUiLog(`adapter->ui ${actionLabel(message.command)} response ${status}${details}`);
+            }
+          }
+        },
+        onError: (err) => {
+          debugUiLog(`tracker error: ${String(err)}`);
         },
         onExit: () => {
           mikroSelectedThreadRunning = false;
+          debugUiLog(`debug adapter exit session=${session.id}`);
           if (vscode.debug.activeDebugSession?.id === session.id) {
             svdTree.setDebugSession(null);
           }
@@ -555,11 +712,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   svdTree.setDebugSession(vscode.debug.activeDebugSession ?? null);
 
   let autoPromptTimer: NodeJS.Timeout | undefined;
-  let autoApplyTimer: NodeJS.Timeout | undefined;
   let autoPromptKey: string | null = null;
-  let latestPrompt: AssertPrompt | null = null;
-  let autoPromptInFlight = false;
   let pauseOnAssertKey: string | null = null;
+  let autoApplyKey: string | null = null;
+  let promptUpdateVersion = 0; // incremented on each onPromptChanged fire to cancel stale async work
   const assertRegistersByKey = new Map<string, AssertRegister[]>();
   const assertPanel = new AssertHelperPanel(simController);
   const helperViewProvider = vscode.window.registerWebviewViewProvider("mikroDesign.assertHelper", assertPanel);
@@ -570,10 +726,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       clearTimeout(autoPromptTimer);
       autoPromptTimer = undefined;
     }
-    if (autoApplyTimer) {
-      clearTimeout(autoApplyTimer);
-      autoApplyTimer = undefined;
-    }
   };
 
   globalCleanupHandlers.push(() => {
@@ -583,27 +735,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   simController.onPromptChanged(async (prompt) => {
+    // Increment version so that any in-flight async work from a previous fire is abandoned.
+    const myVersion = ++promptUpdateVersion;
     if (prompt) {
       await maybeRepairSvdForAddress(prompt.addr);
     }
     svdTree.setActiveAddress(prompt ? prompt.addr : null);
     // Don't auto-reveal location to avoid focus fighting
     if (!prompt) {
-      latestPrompt = null;
       autoPromptKey = null;
       pauseOnAssertKey = null;
-      autoPromptInFlight = false;
+      autoApplyKey = null;
       assertRegistersByKey.clear();
       clearTimers();
       assertPanel.clear();
       return;
     }
-    latestPrompt = prompt;
-    if (prompt.type === "write") {
+    const autoApplyRecommendation =
+      (getConfig<boolean>("mikroDesign.assertAutoApplyRecommendation") ?? false) ||
+      process.env.MIKRO_ASSERT_AUTO_APPLY_RECOMMENDATION === "1";
+    if (prompt.type === "write" && !autoApplyRecommendation) {
       return;
     }
     const promptReady = isAssertPromptReady(prompt);
-    const pauseOnAssert = getConfig<boolean>("mikroDesign.pauseOnAssert") ?? true;
+    const pauseOnAssert = true;
     const key = `${prompt.type}:${prompt.addr}:${prompt.size}:${prompt.pc}`;
     if (pauseOnAssert && promptReady) {
       if (pauseOnAssertKey !== key) {
@@ -614,10 +769,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!promptReady) {
       return;
     }
-    const showPanel = getConfig<boolean>("mikroDesign.assertShowPanel") ?? true;
-    const autoShowTrace = getConfig<boolean>("mikroDesign.assertTraceAutoShow") ?? true;
-    const autoApply = getConfig<boolean>("mikroDesign.assertAutoApplyRecommendation") ?? false;
+
+    // Show the panel immediately with whatever data we have, before slow async work.
     const recommendation = recommendAssertAction(prompt);
+    assertPanel.show(prompt, recommendation, []);
+    assertPanel.reveal();
+
+    // Bail out if a newer prompt update has superseded us.
+    if (promptUpdateVersion !== myVersion) {
+      return;
+    }
+    const showPanel = true;
+    const autoShowTrace = true;
     let location: AssertLocation | null = null;
     try {
       const loc = await codeLensProvider.getPromptLocation();
@@ -627,6 +790,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     } catch {
       // ignore mapping failures
     }
+    if (promptUpdateVersion !== myVersion) {
+      return;
+    }
     let registers = assertRegistersByKey.get(key);
     if (!registers) {
       registers = await captureAssertRegisters();
@@ -634,15 +800,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         assertRegistersByKey.set(key, registers);
       }
     }
+    if (promptUpdateVersion !== myVersion) {
+      return;
+    }
     traceStore.upsertPrompt(prompt, location, recommendation as TraceRecommendation, registers);
 
-    // Update and optionally reveal helper panel on actionable prompt.
-    assertPanel.show(prompt, recommendation, registers ?? []);
-    if (showPanel) {
-      assertPanel.reveal();
+    // Update panel again with registers if we got them.
+    if (registers && registers.length > 0) {
+      assertPanel.show(prompt, recommendation, registers);
     }
     if (process.env.MIKRO_DEBUG_EXTENSIONS === "1") {
       appendDebugLog("assert helper panel shown");
+    }
+    if (autoApplyRecommendation && autoApplyKey !== key) {
+      autoApplyKey = key;
+      const result = applyAssertRecommendation(prompt, simController);
+      output.appendLine(`[SIM] ${result.message}`);
+      if (process.env.MIKRO_DEBUG_EXTENSIONS === "1") {
+        appendDebugLog(`assert auto-applied recommendation: ${result.message}`);
+      }
+      return;
     }
     tracePanel.refresh();
     if (autoShowTrace) {
@@ -657,7 +834,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const assertResponseWatcher = simController.onAssertResponse((event) => {
     traceStore.markResponse(event.prompt, event.response);
-    const resumeOnAssert = getConfig<boolean>("mikroDesign.resumeOnAssertResponse") ?? false;
+    const resumeOnAssert = false;
     if (resumeOnAssert) {
       void resumeDebugSession();
     }
@@ -667,17 +844,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (session.type !== "mikroDesign") {
       return;
     }
+    debugUiLog(`session start id=${session.id} name=${session.name}`);
+    startAdapterLogMirror();
     mikroSelectedThreadRunning = false;
     setMikroSessionContext(true);
     await dockAssertViewsToRightSidebar();
-    const showPanel = getConfig<boolean>("mikroDesign.assertShowPanel") ?? true;
-    const autoShowTrace = getConfig<boolean>("mikroDesign.assertTraceAutoShow") ?? true;
-    if (showPanel) {
+    const assertFile = getConfig<string>("mikroDesign.assertFile");
+    const assertMode = getConfig<string>("mikroDesign.assertMode") ?? "assist";
+    if (assertMode !== "none" && !assertFile) {
+      await autoCreateAssertFileIfNeeded();
+    }
+    if (true) {
       assertPanel.reveal();
     }
-    if (autoShowTrace) {
-      tracePanel.reveal();
-    }
+    tracePanel.reveal();
   });
 
   const selectSvdCommand = vscode.commands.registerCommand("mikroDesign.selectSvd", async () => {
@@ -690,12 +870,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     const svdPath = uri[0].fsPath;
     await updateConfig("mikroDesign.svdPath", svdPath);
-    if (svdViewVisible) {
-      svdTree.loadFromFile(svdPath);
-      loadedSvdPath = svdPath;
-    } else {
-      loadedSvdPath = null;
-    }
+    svdTree.loadFromFile(svdPath);
+    loadedSvdPath = svdPath;
     await focusSvdView(treeView);
     await maybeLoadSvd();
     await revealSvdRoot(treeView, svdTree);
@@ -712,12 +888,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       vscode.window.showWarningMessage("SVD path not found.");
       return;
     }
-    if (svdViewVisible) {
-      svdTree.loadFromFile(resolved);
-      loadedSvdPath = resolved;
-    } else {
-      loadedSvdPath = null;
-    }
+    svdTree.loadFromFile(resolved);
+    loadedSvdPath = resolved;
     await focusSvdView(treeView);
     await maybeLoadSvd();
     await revealSvdRoot(treeView, svdTree);
@@ -858,12 +1030,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await updateConfig("mikroDesign.toolchainBin", toolchainPick);
       const gdbSetting = (config.get<string>("mikroDesign.gdbPath") ?? "").trim();
       const addr2lineSetting = (config.get<string>("mikroDesign.addr2linePath") ?? "").trim();
-      const gdbPath = path.join(toolchainPick, "riscv32-unknown-elf-gdb");
-      const addr2linePath = path.join(toolchainPick, "riscv32-unknown-elf-addr2line");
-      if (!gdbSetting || gdbSetting === "riscv32-unknown-elf-gdb") {
+      const gdbCandidates = [
+        path.join(toolchainPick, "riscv-none-elf-gdb"),
+        path.join(toolchainPick, "riscv32-unknown-elf-gdb"),
+      ];
+      const addr2lineCandidates = [
+        path.join(toolchainPick, "riscv-none-elf-addr2line"),
+        path.join(toolchainPick, "riscv32-unknown-elf-addr2line"),
+      ];
+      const gdbPath = gdbCandidates.find((candidate) => fs.existsSync(candidate)) ?? gdbCandidates[0];
+      const addr2linePath =
+        addr2lineCandidates.find((candidate) => fs.existsSync(candidate)) ?? addr2lineCandidates[0];
+      if (
+        !gdbSetting ||
+        gdbSetting === "riscv32-unknown-elf-gdb" ||
+        gdbSetting === "riscv-none-elf-gdb"
+      ) {
         await updateConfig("mikroDesign.gdbPath", gdbPath);
       }
-      if (!addr2lineSetting || addr2lineSetting === "riscv32-unknown-elf-addr2line") {
+      if (
+        !addr2lineSetting ||
+        addr2lineSetting === "riscv32-unknown-elf-addr2line" ||
+        addr2lineSetting === "riscv-none-elf-addr2line"
+      ) {
         await updateConfig("mikroDesign.addr2linePath", addr2linePath);
       }
     }
@@ -952,10 +1141,97 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const setupProjectCommand = vscode.commands.registerCommand("mikroDesign.setupProject", runSetupProject);
+  const openSdkProjectCommand = vscode.commands.registerCommand("mikroDesign.openSdkProject", async () => {
+    try {
+      const config = vscode.workspace.getConfiguration();
+      const currentSdk = resolvePath(config.get<string>("mikroDesign.sdkPath")) ?? undefined;
+      const sdkPick = await pickSdkPath(currentSdk);
+      if (!sdkPick) {
+        return;
+      }
+
+      const apps = listApps(sdkPick);
+      if (!apps.length) {
+        vscode.window.showErrorMessage("No apps found under <sdk>/app.");
+        return;
+      }
+      const currentApp = (config.get<string>("mikroDesign.appName") ?? "").trim();
+      const appName = await pickAppName(apps, currentApp);
+      if (!appName) {
+        return;
+      }
+
+      const appDir = path.join(sdkPick, "app", appName);
+      const scan = scanAppConfig(appDir);
+      if (!scan.configs.length && !scan.defaultConfig) {
+        vscode.window.showErrorMessage(`No configs found in ${appDir}.`);
+        return;
+      }
+      const currentConfig = (config.get<string>("mikroDesign.configName") ?? "").trim();
+      const configName = await pickConfigName(scan, currentConfig);
+      if (!configName) {
+        return;
+      }
+
+      const currentToolchain = (config.get<string>("mikroDesign.toolchain") ?? "").trim();
+      const toolchainName = await pickToolchainName(scan, currentToolchain);
+      if (!toolchainName) {
+        return;
+      }
+
+      const targetInfo = parseTargetFromConfig(sdkPick, appName, configName);
+      const currentDebugTarget = (config.get<string>("mikroDesign.debugTarget") ?? "rv32sim").trim();
+      const debugTarget = await pickDebugTarget(targetInfo, currentDebugTarget);
+      if (!debugTarget) {
+        return;
+      }
+
+      let rv32simPath: string | undefined;
+      if (debugTarget === "rv32sim") {
+        const rv32simPick = await pickRv32simPath(
+          resolvePath(config.get<string>("mikroDesign.rv32simPath")),
+          getWorkspaceRoot()
+        );
+        if (!rv32simPick) {
+          return;
+        }
+        rv32simPath = rv32simPick;
+      }
+
+      const toolchainBinPick = await pickToolchainBin(
+        resolvePath(config.get<string>("mikroDesign.toolchainBin")) ?? undefined
+      );
+      if (toolchainBinPick === null) {
+        return;
+      }
+      const toolchainBin = toolchainBinPick ?? undefined;
+
+      const workspacePath = await ensureSdkProjectWorkspaceFile({
+        sdkPath: sdkPick,
+        appName,
+        configName,
+        toolchain: toolchainName,
+        debugTarget,
+        rv32simPath,
+        toolchainBin,
+        target: targetInfo?.target,
+      });
+      if (!workspacePath) {
+        return;
+      }
+      output.appendLine(`[SDK] Open workspace: ${workspacePath}`);
+      await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(workspacePath), false);
+    } catch (err) {
+      const message = err instanceof Error ? err.stack || err.message : String(err);
+      output.appendLine(`[SDK] Open SDK project failed: ${message}`);
+      output.show(true);
+      vscode.window.showErrorMessage("Mikro: Open SDK Project failed. See 'Mikro Design' output.");
+    }
+  });
 
   const attachGdbCommand = vscode.commands.registerCommand("mikroDesign.attachGdb", async () => {
     const config = vscode.workspace.getConfiguration();
-    const gdbPath = config.get<string>("mikroDesign.gdbPath") ?? "riscv32-unknown-elf-gdb";
+    const gdbPath = config.get<string>("mikroDesign.gdbPath") ?? "riscv-none-elf-gdb";
     const port = config.get<number>("mikroDesign.gdbPort") ?? 3333;
     const elfPath = await pickElfPath(config.get<string>("mikroDesign.elfPath"));
     if (elfPath) {
@@ -983,7 +1259,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (session) {
       try {
         await session.customRequest("evaluate", {
-          expression: `monitor load_elf ${elfPath}`,
+          expression: `monitor load_elf ${quotePath(elfPath)}`,
           context: "repl",
         });
         return;
@@ -1026,6 +1302,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     simController.sendDefaultAssertResponse();
   });
 
+  const applyRecommendedCommand = vscode.commands.registerCommand("mikroDesign.assert.applyRecommendation", () => {
+    const result = applyAssertRecommendation(simController.currentPrompt, simController);
+    output.appendLine(`[SIM] ${result.message}`);
+    if (process.env.MIKRO_DEBUG_EXTENSIONS === "1") {
+      appendDebugLog(`assert apply recommendation: ${result.message}`);
+    }
+  });
+
   const clearTraceCommand = vscode.commands.registerCommand("mikroDesign.assert.clearTrace", () => {
     traceStore.clear();
     tracePanel.refresh();
@@ -1042,6 +1326,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await dockAssertViewsToRightSidebar();
   });
 
+  const assertWizardCommand = vscode.commands.registerCommand("mikroDesign.assertWizard", () => runAssertWizard());
+
   context.subscriptions.push(
     selectSvdCommand,
     refreshSvdCommand,
@@ -1052,6 +1338,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     startSimCommand,
     stopSimCommand,
     setupProjectCommand,
+    openSdkProjectCommand,
     selectAssertFileCommand,
     createAssertFileCommand,
     attachGdbCommand,
@@ -1060,9 +1347,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     sendChoiceCommand,
     ignoreCommand,
     defaultCommand,
+    applyRecommendedCommand,
     clearTraceCommand,
     showTraceCommand,
     forceDockAssertViewsCommand,
+    assertWizardCommand,
     debugSessionWatcher,
     treeVisibilityWatcher,
     assertResponseWatcher,
@@ -1104,15 +1393,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     vscode.debug.onDidStartDebugSession((session) => {
-      appendDebugLog(`debug session started type=${session.type}`);
       if (session.type === "mikroDesign") {
+        output.appendLine(`[Mikro] Debug session started: ${session.name} (id=${session.id})`);
+        output.show(true);
         mikroSelectedThreadRunning = false;
         setMikroSessionContext(true);
       }
+      appendDebugLog(`debug session started type=${session.type}`);
     }),
     vscode.debug.onDidTerminateDebugSession((session) => {
-      appendDebugLog(`debug session ended type=${session.type}`);
       if (session.type === "mikroDesign") {
+        output.appendLine(`[Mikro] Debug session ended: ${session.name} (id=${session.id})`);
+        debugUiLog(`session end id=${session.id} name=${session.name}`);
+        stopAdapterLogMirror();
         mikroSelectedThreadRunning = false;
         simController.stop();
       }
@@ -1145,8 +1438,10 @@ type SetupPickItem = vscode.QuickPickItem & { value?: string; action?: "browse" 
 type TargetInfo = { target?: string; chip?: string; board?: string; configPath?: string };
 
 function isSdkRoot(candidate: string): boolean {
-  const appRoot = path.join(candidate, "app");
-  return fs.existsSync(appRoot) && fs.statSync(appRoot).isDirectory();
+  return (
+    fs.existsSync(path.join(candidate, "app")) &&
+    fs.existsSync(path.join(candidate, "make", "app.mk"))
+  );
 }
 
 async function pickSdkPath(current: string | undefined): Promise<string | null> {
@@ -1186,7 +1481,7 @@ async function pickSdkPath(current: string | undefined): Promise<string | null> 
       }
       const selected = uri[0].fsPath;
       if (!isSdkRoot(selected)) {
-        vscode.window.showWarningMessage("Selected folder does not look like an SDK root (missing app/).");
+        vscode.window.showWarningMessage("Selected folder does not look like an SDK root (missing app/ or make/app.mk).");
         continue;
       }
       return selected;
@@ -1194,7 +1489,7 @@ async function pickSdkPath(current: string | undefined): Promise<string | null> 
     if (pick.value && isSdkRoot(pick.value)) {
       return pick.value;
     }
-    vscode.window.showWarningMessage("Selected folder does not look like an SDK root (missing app/).");
+    vscode.window.showWarningMessage("Selected folder does not look like an SDK root (missing app/ or make/app.mk).");
   }
 }
 
@@ -1203,16 +1498,25 @@ function normalizeToolchainBin(candidate: string): string | undefined {
   if (!resolved) {
     return undefined;
   }
-  if (resolved.endsWith("riscv32-unknown-elf-gcc")) {
+  if (resolved.endsWith("riscv-none-elf-gcc") || resolved.endsWith("riscv32-unknown-elf-gcc")) {
     const binDir = path.dirname(resolved);
-    if (fs.existsSync(path.join(binDir, "riscv32-unknown-elf-gcc"))) {
+    if (
+      fs.existsSync(path.join(binDir, "riscv-none-elf-gcc")) ||
+      fs.existsSync(path.join(binDir, "riscv32-unknown-elf-gcc"))
+    ) {
       return binDir;
     }
   }
-  if (fs.existsSync(path.join(resolved, "riscv32-unknown-elf-gcc"))) {
+  if (
+    fs.existsSync(path.join(resolved, "riscv-none-elf-gcc")) ||
+    fs.existsSync(path.join(resolved, "riscv32-unknown-elf-gcc"))
+  ) {
     return resolved;
   }
-  if (fs.existsSync(path.join(resolved, "bin", "riscv32-unknown-elf-gcc"))) {
+  if (
+    fs.existsSync(path.join(resolved, "bin", "riscv-none-elf-gcc")) ||
+    fs.existsSync(path.join(resolved, "bin", "riscv32-unknown-elf-gcc"))
+  ) {
     return path.join(resolved, "bin");
   }
   return undefined;
@@ -1259,7 +1563,9 @@ async function pickToolchainBin(current: string | undefined): Promise<string | n
       }
       const normalized = normalizeToolchainBin(uri[0].fsPath);
       if (!normalized) {
-        vscode.window.showWarningMessage("Toolchain bin not found (missing riscv32-unknown-elf-gcc).");
+        vscode.window.showWarningMessage(
+          "Toolchain bin not found (missing riscv-none-elf-gcc or riscv32-unknown-elf-gcc)."
+        );
         continue;
       }
       return normalized;
@@ -1267,7 +1573,9 @@ async function pickToolchainBin(current: string | undefined): Promise<string | n
     if (pick.value) {
       const normalized = normalizeToolchainBin(pick.value) ?? pick.value;
       if (!normalized) {
-        vscode.window.showWarningMessage("Toolchain bin not found (missing riscv32-unknown-elf-gcc).");
+        vscode.window.showWarningMessage(
+          "Toolchain bin not found (missing riscv-none-elf-gcc or riscv32-unknown-elf-gcc)."
+        );
         continue;
       }
       return normalized;
@@ -1466,6 +1774,92 @@ async function pickRv32simPath(
   }
 }
 
+async function ensureSdkProjectWorkspaceFile(params: {
+  sdkPath: string;
+  appName: string;
+  configName: string;
+  toolchain: string;
+  debugTarget: string;
+  rv32simPath?: string;
+  toolchainBin?: string;
+  target?: string;
+}): Promise<string | null> {
+  const workspaceDir = path.join(
+    params.sdkPath,
+    "build",
+    params.appName,
+    params.configName,
+    params.toolchain
+  );
+  const workspacePath = path.join(workspaceDir, `${params.appName}.code-workspace`);
+  const elfPath = path.join(
+    params.sdkPath,
+    "build",
+    params.appName,
+    params.configName,
+    params.toolchain,
+    `${params.appName}.elf`
+  );
+  const managedFolders: { name?: string; path: string }[] = [
+    {
+      name: `sdk:${path.basename(params.sdkPath)}`,
+      path: path.resolve(params.sdkPath),
+    },
+  ];
+
+  const workspaceDoc: Record<string, unknown> = {
+    folders: managedFolders,
+    settings: {},
+  };
+  if (fs.existsSync(workspacePath)) {
+    try {
+      const raw = fs.readFileSync(workspacePath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        Object.assign(workspaceDoc, parsed);
+      }
+    } catch {
+      vscode.window.showWarningMessage(`Failed to parse existing workspace file: ${workspacePath}`);
+    }
+  } else {
+    fs.mkdirSync(workspaceDir, { recursive: true });
+  }
+
+  // Keep workspace deterministic to avoid noisy per-folder .vscode resolution
+  // in multi-root setups.
+  workspaceDoc.folders = managedFolders;
+
+  const settings =
+    workspaceDoc.settings && typeof workspaceDoc.settings === "object"
+      ? { ...(workspaceDoc.settings as Record<string, unknown>) }
+      : {};
+  settings["mikroDesign.sdkPath"] = params.sdkPath;
+  settings["mikroDesign.appName"] = params.appName;
+  settings["mikroDesign.configName"] = params.configName;
+  settings["mikroDesign.toolchain"] = params.toolchain;
+  settings["mikroDesign.elfPath"] = elfPath;
+  settings["mikroDesign.debugTarget"] = params.debugTarget;
+  settings["mikroDesign.buildPolicy"] = "ifChanged";
+  if (params.rv32simPath) {
+    settings["mikroDesign.rv32simPath"] = params.rv32simPath;
+  }
+  if (params.toolchainBin) {
+    settings["mikroDesign.toolchainBin"] = params.toolchainBin;
+  }
+  if (params.target) {
+    settings["mikroDesign.target"] = params.target;
+  }
+  workspaceDoc.settings = settings;
+
+  try {
+    fs.writeFileSync(workspacePath, JSON.stringify(workspaceDoc, null, 2) + "\n", "utf8");
+    return workspacePath;
+  } catch (err) {
+    vscode.window.showErrorMessage(`Failed to write workspace file: ${String(err)}`);
+    return null;
+  }
+}
+
 async function ensureWorkspaceBuildTask(params: {
   sdkPath: string;
   appName: string;
@@ -1587,11 +1981,10 @@ async function revealSvdRoot(
   }
 }
 
+/** Shell-safe quoting using single quotes to prevent injection of metacharacters. */
 function quotePath(value: string): string {
-  if (value.includes(" ")) {
-    return `"${value}"`;
-  }
-  return value;
+  // Single-quote the value, escaping any embedded single quotes as '\''
+  return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
 async function dockAssertViewsToRightSidebar(): Promise<void> {
@@ -1655,17 +2048,32 @@ async function forcePauseOnAssert(): Promise<void> {
     appendDebugLog("forcePauseOnAssert skipped: no active mikroDesign session");
     return;
   }
+  const now = Date.now();
+  if (forcePauseInFlight) {
+    appendDebugLog("forcePauseOnAssert skipped: pause already in-flight");
+    return;
+  }
+  if (now - forcePauseLastMs < 250) {
+    appendDebugLog("forcePauseOnAssert skipped: debounce");
+    return;
+  }
   if (!mikroSelectedThreadRunning) {
     appendDebugLog("forcePauseOnAssert skipped: session already stopped");
     return;
   }
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    appendDebugLog(`forcePauseOnAssert attempt=${attempt}`);
-    await pauseDebugSession();
-    await new Promise((resolve) => setTimeout(resolve, 80 * attempt));
-    if (!mikroSelectedThreadRunning) {
-      return;
+  forcePauseInFlight = true;
+  try {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      appendDebugLog(`forcePauseOnAssert attempt=${attempt}`);
+      await pauseDebugSession();
+      await new Promise((resolve) => setTimeout(resolve, 80 * attempt));
+      if (!mikroSelectedThreadRunning) {
+        return;
+      }
     }
+  } finally {
+    forcePauseInFlight = false;
+    forcePauseLastMs = Date.now();
   }
 }
 
@@ -1682,40 +2090,50 @@ async function resumeDebugSession(): Promise<void> {
   }
 }
 
+let captureAssertInFlight = false;
 async function captureAssertRegisters(): Promise<AssertRegister[]> {
   const session = vscode.debug.activeDebugSession;
   if (!session || session.type !== "mikroDesign") {
     return [];
   }
-  // Give pause a short window to settle into a true stopped state.
-  for (let attempt = 0; attempt < 14; attempt += 1) {
-    try {
-      const response = await session.customRequest("mikro.getRegisters");
-      const running = Boolean(response?.running);
-      const regs = Array.isArray(response?.registers)
-        ? response.registers
-            .map((item: any) => ({
-              name: String(item?.name ?? "").trim(),
-              value: String(item?.value ?? "").trim(),
-            }))
-            .filter((item: AssertRegister) => item.name.length > 0 && item.value.length > 0)
-        : [];
-      if (regs.length > 0) {
-        return regs;
-      }
-      if (!running) {
-        return [];
-      }
-      // If still running, ask adapter to pause once more.
-      if (attempt % 3 === 2) {
-        await forcePauseOnAssert();
-      }
-    } catch {
-      // ignore and retry briefly
-    }
-    await new Promise((resolve) => setTimeout(resolve, 120 + attempt * 20));
+  if (captureAssertInFlight) {
+    return []; // prevent concurrent storms
   }
-  return [];
+  captureAssertInFlight = true;
+  try {
+    // Give pause a short window to settle into a true stopped state.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const response = await session.customRequest("mikro.getRegisters");
+        const running = Boolean(response?.running);
+        const synthetic = Boolean(response?.syntheticStop);
+        const regs = Array.isArray(response?.registers)
+          ? response.registers
+              .map((item: any) => ({
+                name: String(item?.name ?? "").trim(),
+                value: String(item?.value ?? "").trim(),
+              }))
+              .filter((item: AssertRegister) => item.name.length > 0 && item.value.length > 0)
+          : [];
+        if (regs.length > 0) {
+          return regs;
+        }
+        // Adapter says GDB still thinks target is running (synthetic stop) — don't retry
+        if (synthetic) {
+          return regs;
+        }
+        if (!running) {
+          return [];
+        }
+      } catch {
+        // ignore and retry briefly
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return [];
+  } finally {
+    captureAssertInFlight = false;
+  }
 }
 
 async function continueDebugSessionSafe(): Promise<void> {
@@ -1760,6 +2178,9 @@ function isAssertPromptReady(prompt: AssertPrompt): boolean {
 }
 
 function appendDebugLog(message: string): void {
+  if (process.env.MIKRO_DEBUG_EXTENSIONS !== "1") {
+    return;
+  }
   const logPath = path.join(getWorkspaceRoot() ?? process.cwd(), ".mikro-debug.log");
   try {
     fs.appendFileSync(logPath, `${new Date().toISOString()} ${message}\n`);
@@ -1806,7 +2227,8 @@ function escapeHtml(text: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function renderAssertHelperShellHtml(webview: vscode.Webview): string {
@@ -1815,7 +2237,7 @@ function renderAssertHelperShellHtml(webview: vscode.Webview): string {
 <html>
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' 'unsafe-eval';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
     <style>
       * { box-sizing: border-box; }
       :root {
@@ -1929,7 +2351,8 @@ function renderAssertHelperShellHtml(webview: vscode.Webview): string {
               .replace(/&/g, "&amp;")
               .replace(/</g, "&lt;")
               .replace(/>/g, "&gt;")
-              .replace(/\\\"/g, "&quot;");
+              .replace(/"/g, "&quot;")
+              .replace(/'/g, "&#39;");
           }
 
           function renderEmpty() {
@@ -2052,12 +2475,7 @@ function renderAssertHelperShellHtml(webview: vscode.Webview): string {
 }
 
 function getNonce(): string {
-  let text = "";
-  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 32; i++) {
-    text += possible.charAt(Math.floor(Math.random() * possible.length));
-  }
-  return text;
+  return crypto.randomBytes(24).toString("base64url");
 }
 
 async function pickElfPath(defaultPath?: string): Promise<string | undefined> {
