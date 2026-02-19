@@ -10,5 +10,5 @@
     "types": ["node", "vscode"],
     "skipLibCheck": true
   },
-  "exclude": ["node_modules", ".vscode-test"]
+  "exclude": ["node_modules", ".vscode-test", "src/test", "*.config.ts", "*.mjs"]
 }

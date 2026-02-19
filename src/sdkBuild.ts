@@ -18,6 +18,38 @@ interface ConfigScan {
   defaultToolchain?: string;
 }
 
+interface InferredBuildPath {
+  sdkPath: string;
+  appName: string;
+  configName: string;
+  toolchain: string;
+  elfPath: string;
+}
+
+function isValidSdkRoot(dir: string): boolean {
+  return (
+    fs.existsSync(path.join(dir, "app")) &&
+    fs.existsSync(path.join(dir, "make", "app.mk"))
+  );
+}
+
+/** Walk up from `start` looking for a directory that passes `isValidSdkRoot`. */
+function findSdkRootUpwards(start: string): string | undefined {
+  let dir = path.resolve(start);
+  const root = path.parse(dir).root;
+  while (true) {
+    if (isValidSdkRoot(dir)) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir || parent === root) {
+      break;
+    }
+    dir = parent;
+  }
+  return undefined;
+}
+
 function readMakeDefault(makefileText: string, key: string): string | undefined {
   const pattern = new RegExp(`^\\s*${key}\\s*[:?+]?=\\s*([^\\s#]+)`, "m");
   const match = makefileText.match(pattern);
@@ -65,30 +97,26 @@ function setConfigValue(key: string, value: string): Thenable<void> {
   return vscode.workspace.getConfiguration().update(key, value, vscode.ConfigurationTarget.Workspace);
 }
 
-function ensureSdkPath(output: vscode.OutputChannel): string | null {
+async function ensureSdkPath(output: vscode.OutputChannel): Promise<string | null> {
   const config = vscode.workspace.getConfiguration();
   const sdkPathRaw = config.get<string>("mikroDesign.sdkPath");
-  const candidate = sdkPathRaw && sdkPathRaw.trim() ? sdkPathRaw : "/home/veba/work/gitlab/onio.firmware.c";
+  const candidate = sdkPathRaw?.trim() || undefined;
   const workspaceRoot = getWorkspaceRoot();
-  const sdkPath = resolvePath(candidate, workspaceRoot);
-  if (sdkPath && fs.existsSync(sdkPath)) {
+  const sdkPath = candidate ? resolvePath(candidate, workspaceRoot) : undefined;
+  // Accept configured path only if it is a valid SDK root.
+  if (sdkPath && fs.existsSync(sdkPath) && isValidSdkRoot(sdkPath)) {
     if (sdkPathRaw !== sdkPath) {
-      setConfigValue("mikroDesign.sdkPath", sdkPath).then(
-        () => output.appendLine(`[SDK] Set sdkPath to ${sdkPath}`),
-        () => undefined
-      );
+      await setConfigValue("mikroDesign.sdkPath", sdkPath);
+      output.appendLine(`[SDK] Set sdkPath to ${sdkPath}`);
     }
     return sdkPath;
   }
-  if (workspaceRoot) {
-    const appRoot = path.join(workspaceRoot, "app");
-    if (fs.existsSync(appRoot) && fs.statSync(appRoot).isDirectory()) {
-      setConfigValue("mikroDesign.sdkPath", workspaceRoot).then(
-        () => output.appendLine(`[SDK] Set sdkPath to ${workspaceRoot}`),
-        () => undefined
-      );
-      return workspaceRoot;
-    }
+  // Auto-detect: walk up from workspace root (handles build-output directories).
+  const found = workspaceRoot ? findSdkRootUpwards(workspaceRoot) : undefined;
+  if (found) {
+    await setConfigValue("mikroDesign.sdkPath", found);
+    output.appendLine(`[SDK] Set sdkPath to ${found}`);
+    return found;
   }
   // Don't show error - just return null silently (only show errors when user actively debugs)
   return null;
@@ -109,10 +137,109 @@ function appFromEditor(sdkPath: string): string | undefined {
   return parts.length > 0 ? parts[0] : undefined;
 }
 
+function inferFromElfPath(elfPathRaw: string | undefined, sdkPathHint?: string): InferredBuildPath | null {
+  if (!elfPathRaw) {
+    return null;
+  }
+  const elfPath = path.resolve(elfPathRaw);
+  if (!elfPath.endsWith(".elf")) {
+    return null;
+  }
+  const toolchainDir = path.dirname(elfPath);
+  const configDir = path.dirname(toolchainDir);
+  const appDir = path.dirname(configDir);
+  const buildDir = path.dirname(appDir);
+  if (path.basename(buildDir) !== "build") {
+    return null;
+  }
+  const appName = path.basename(appDir);
+  const configName = path.basename(configDir);
+  const toolchain = path.basename(toolchainDir);
+  const sdkPath = path.dirname(buildDir);
+  if (sdkPathHint && path.resolve(sdkPathHint) !== sdkPath) {
+    return null;
+  }
+  if (!appName || !configName || !toolchain) {
+    return null;
+  }
+  return {
+    sdkPath,
+    appName,
+    configName,
+    toolchain,
+    elfPath,
+  };
+}
+
+function inferFromActiveEditorPath(sdkPath: string): InferredBuildPath | null {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return null;
+  }
+  const filePath = editor.document.uri.fsPath;
+  const sdkBuildRoot = path.join(sdkPath, "build") + path.sep;
+  if (!filePath.startsWith(sdkBuildRoot)) {
+    return null;
+  }
+  const relative = filePath.slice(sdkBuildRoot.length);
+  const parts = relative.split(path.sep).filter((part) => part.length > 0);
+  if (parts.length < 3) {
+    return null;
+  }
+  const [appName, configName, toolchain] = parts;
+  const elfPath = path.join(sdkPath, "build", appName, configName, toolchain, `${appName}.elf`);
+  return {
+    sdkPath,
+    appName,
+    configName,
+    toolchain,
+    elfPath,
+  };
+}
+
+function inferBuildPathFromContext(sdkPath: string): InferredBuildPath | null {
+  const config = vscode.workspace.getConfiguration();
+  const configuredElf = resolvePath(config.get<string>("mikroDesign.elfPath"), getWorkspaceRoot()) ?? undefined;
+  const fromElf = inferFromElfPath(configuredElf, sdkPath);
+  if (fromElf) {
+    return fromElf;
+  }
+  return inferFromActiveEditorPath(sdkPath);
+}
+
 export async function autoConfigureFromActiveEditor(output: vscode.OutputChannel): Promise<void> {
-  const sdkPath = ensureSdkPath(output);
+  const sdkPath = await ensureSdkPath(output);
   if (!sdkPath) {
     return;
+  }
+  const inferred = inferBuildPathFromContext(sdkPath);
+  if (inferred) {
+    const config = vscode.workspace.getConfiguration();
+    const currentSdk = resolvePath(config.get<string>("mikroDesign.sdkPath"), getWorkspaceRoot()) ?? "";
+    const currentApp = (config.get<string>("mikroDesign.appName") ?? "").trim();
+    const currentCfg = (config.get<string>("mikroDesign.configName") ?? "").trim();
+    const currentToolchain = (config.get<string>("mikroDesign.toolchain") ?? "").trim();
+    const currentElf = resolvePath(config.get<string>("mikroDesign.elfPath"), getWorkspaceRoot()) ?? "";
+    if (currentSdk !== inferred.sdkPath) {
+      await setConfigValue("mikroDesign.sdkPath", inferred.sdkPath);
+      output.appendLine(`[SDK] Set sdkPath to ${inferred.sdkPath}`);
+    }
+    if (currentApp !== inferred.appName) {
+      await setConfigValue("mikroDesign.appName", inferred.appName);
+      output.appendLine(`[SDK] Set appName to ${inferred.appName}`);
+    }
+    if (currentCfg !== inferred.configName) {
+      await setConfigValue("mikroDesign.configName", inferred.configName);
+      output.appendLine(`[SDK] Set configName to ${inferred.configName}`);
+    }
+    if (!currentToolchain || currentToolchain !== inferred.toolchain) {
+      await setConfigValue("mikroDesign.toolchain", inferred.toolchain);
+      output.appendLine(`[SDK] Set toolchain to ${inferred.toolchain}`);
+    }
+    if (currentElf !== inferred.elfPath) {
+      await setConfigValue("mikroDesign.elfPath", inferred.elfPath);
+      output.appendLine(`[SDK] Set elfPath to ${inferred.elfPath}`);
+    }
   }
   const config = vscode.workspace.getConfiguration();
   const appNameSetting = config.get<string>("mikroDesign.appName") ?? "";
@@ -141,11 +268,43 @@ export async function autoConfigureFromActiveEditor(output: vscode.OutputChannel
 }
 
 export async function ensureBuildInfo(output: vscode.OutputChannel): Promise<MikroBuildInfo | null> {
-  const sdkPath = ensureSdkPath(output);
+  const sdkPath = await ensureSdkPath(output);
   if (!sdkPath) {
     return null;
   }
   const config = vscode.workspace.getConfiguration();
+  const inferred = inferBuildPathFromContext(sdkPath);
+  if (inferred) {
+    const currentApp = (config.get<string>("mikroDesign.appName") ?? "").trim();
+    const currentCfg = (config.get<string>("mikroDesign.configName") ?? "").trim();
+    const currentToolchain = (config.get<string>("mikroDesign.toolchain") ?? "").trim();
+    const currentElf = resolvePath(config.get<string>("mikroDesign.elfPath"), getWorkspaceRoot()) ?? "";
+    if (!currentApp || currentApp !== inferred.appName) {
+      await setConfigValue("mikroDesign.appName", inferred.appName);
+      output.appendLine(`[SDK] Set appName to ${inferred.appName}`);
+    }
+    if (!currentCfg || currentCfg !== inferred.configName) {
+      await setConfigValue("mikroDesign.configName", inferred.configName);
+      output.appendLine(`[SDK] Set configName to ${inferred.configName}`);
+    }
+    if (!currentToolchain || currentToolchain !== inferred.toolchain) {
+      await setConfigValue("mikroDesign.toolchain", inferred.toolchain);
+      output.appendLine(`[SDK] Set toolchain to ${inferred.toolchain}`);
+    }
+    if (currentElf !== inferred.elfPath) {
+      await setConfigValue("mikroDesign.elfPath", inferred.elfPath);
+      output.appendLine(`[SDK] Set elfPath to ${inferred.elfPath}`);
+    }
+    return {
+      sdkPath: inferred.sdkPath,
+      appName: inferred.appName,
+      configName: inferred.configName,
+      toolchain: inferred.toolchain,
+      appDir: path.join(inferred.sdkPath, "app", inferred.appName),
+      elfPath: inferred.elfPath,
+    };
+  }
+
   let appName = (config.get<string>("mikroDesign.appName") ?? "").trim();
   if (!appName) {
     const apps = listApps(sdkPath);
@@ -321,9 +480,7 @@ export function resolveToolchainBin(): string | undefined {
     return envToolchain.bin;
   }
   const candidates = [
-    "/home/veba/work/git/riscv-gnu-toolchain/install/bin",
     "/opt/riscv/bin",
-    "/opt/riscv32imc-bitext/2023-11-21-8e9fb09a/bin",
   ];
   for (const candidate of candidates) {
     if (fs.existsSync(path.join(candidate, "riscv32-unknown-elf-gcc"))) {
@@ -347,9 +504,7 @@ export function detectToolchainInfo(): ToolchainInfo | null {
     return envToolchain;
   }
   const candidates = [
-    "/home/veba/work/git/riscv-gnu-toolchain/install/bin",
     "/opt/riscv/bin",
-    "/opt/riscv32imc-bitext/2023-11-21-8e9fb09a/bin",
   ];
   for (const candidate of candidates) {
     if (fs.existsSync(path.join(candidate, "riscv32-unknown-elf-gcc"))) {
@@ -370,10 +525,30 @@ export function resolveBuildInfo(output: vscode.OutputChannel): MikroBuildInfo |
   const configName = (config.get<string>("mikroDesign.configName") ?? "").trim();
   const toolchainSetting = (config.get<string>("mikroDesign.toolchain") ?? "").trim();
 
-  const sdkPath = resolvePath(sdkPathRaw, getWorkspaceRoot());
-  if (!sdkPath || !fs.existsSync(sdkPath)) {
-    // Don't show error - just return null silently
-    return null;
+  let sdkPath = resolvePath(sdkPathRaw, getWorkspaceRoot());
+  if (!sdkPath || !fs.existsSync(sdkPath) || !isValidSdkRoot(sdkPath)) {
+    // Configured path missing or not a valid SDK root — try walking up.
+    const workspaceRoot = getWorkspaceRoot();
+    sdkPath = workspaceRoot ? findSdkRootUpwards(workspaceRoot) : undefined;
+    if (!sdkPath) {
+      return null;
+    }
+  }
+  const inferred = inferBuildPathFromContext(sdkPath);
+  if (inferred) {
+    output.appendLine(`[SDK] sdkPath=${inferred.sdkPath}`);
+    output.appendLine(
+      `[SDK] app=${inferred.appName} config=${inferred.configName} toolchain=${inferred.toolchain}`
+    );
+    output.appendLine(`[SDK] elf=${inferred.elfPath}`);
+    return {
+      sdkPath: inferred.sdkPath,
+      appName: inferred.appName,
+      configName: inferred.configName,
+      toolchain: inferred.toolchain,
+      appDir: path.join(inferred.sdkPath, "app", inferred.appName),
+      elfPath: inferred.elfPath,
+    };
   }
   if (!appName) {
     // Don't show error - just return null silently

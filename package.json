@@ -12,24 +12,11 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:mikroDesign.selectSvd",
-    "onCommand:mikroDesign.refreshSvd",
-    "onCommand:mikroDesign.startSim",
-    "onCommand:mikroDesign.stopSim",
-    "onCommand:mikroDesign.forceDockAssertViews",
-    "onCommand:mikroDesign.attachGdb",
-    "onCommand:mikroDesign.loadElfViaGdb",
-    "onCommand:mikroDesign.setupProject",
-    "onView:mikroDesign.registerMap",
-    "onLanguage:c",
-    "onLanguage:cpp",
-    "onLanguage:asm",
-    "onLanguage:s"
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "extensionKind": [
-    "ui"
+    "workspace"
   ],
   "contributes": {
     "debuggers": [
@@ -66,6 +53,53 @@
                 "type": "boolean",
                 "default": true,
                 "description": "Stop at entry."
+              },
+              "serverType": {
+                "type": "string",
+                "enum": [
+                  "rv32sim",
+                  "openocd",
+                  "jlink",
+                  "pyocd",
+                  "external"
+                ],
+                "default": "rv32sim",
+                "description": "GDB server type."
+              },
+              "serverPath": {
+                "type": "string",
+                "description": "Path to the GDB server executable."
+              },
+              "serverArgs": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": [],
+                "description": "Extra arguments for the GDB server."
+              },
+              "configFiles": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": [],
+                "description": "OpenOCD config files (-f flags)."
+              },
+              "device": {
+                "type": "string",
+                "description": "Target device name (for J-Link/pyOCD)."
+              },
+              "interface": {
+                "type": "string",
+                "enum": ["swd", "jtag"],
+                "default": "swd",
+                "description": "Debug interface (SWD or JTAG)."
+              },
+              "hwBreakpointLimit": {
+                "type": "number",
+                "default": 0,
+                "description": "Hardware breakpoint limit (0 = unknown/unlimited)."
+              },
+              "mikroDesign": {
+                "type": "boolean",
+                "description": "Internal marker for Mikro Design configurations."
               }
             }
           }
@@ -97,6 +131,10 @@
       {
         "command": "mikroDesign.setupProject",
         "title": "Mikro: Setup Project (SDK)"
+      },
+      {
+        "command": "mikroDesign.openSdkProject",
+        "title": "Mikro: Open SDK Project..."
       },
       {
         "command": "mikroDesign.assert.showTrace",
@@ -159,8 +197,16 @@
         "title": "Mikro: Use Default Assert Value"
       },
       {
+        "command": "mikroDesign.assert.applyRecommendation",
+        "title": "Mikro: Apply Recommended Assert Value"
+      },
+      {
         "command": "mikroDesign.forceDockAssertViews",
         "title": "Mikro: Force Dock Assert Views"
+      },
+      {
+        "command": "mikroDesign.assertWizard",
+        "title": "Mikro: Setup Assert Testing"
       }
     ],
     "views": {
@@ -183,6 +229,17 @@
       ]
     },
     "menus": {
+      "menubar/file": [
+        {
+          "command": "mikroDesign.openSdkProject",
+          "group": "1_open@99"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "mikroDesign.openSdkProject"
+        }
+      ],
       "view/title": [
         {
           "command": "mikroDesign.refreshSvd",
@@ -209,7 +266,7 @@
       "properties": {
         "mikroDesign.sdkPath": {
           "type": "string",
-          "default": "/home/veba/work/gitlab/onio.firmware.c",
+          "default": "",
           "description": "Path to the ONiO firmware SDK root."
         },
         "mikroDesign.appName": {
@@ -259,16 +316,6 @@
           "default": true,
           "description": "Remove breakpoints outside the current workspace when starting a Mikro debug session."
         },
-        "mikroDesign.pauseOnAssert": {
-          "type": "boolean",
-          "default": true,
-          "description": "Pause the debug session when an assert prompt arrives."
-        },
-        "mikroDesign.resumeOnAssertResponse": {
-          "type": "boolean",
-          "default": false,
-          "description": "Resume execution automatically after responding to an assert prompt."
-        },
         "mikroDesign.rv32simPath": {
           "type": "string",
           "default": "../rv32sim/rv32sim.py",
@@ -281,12 +328,12 @@
         },
         "mikroDesign.gdbPath": {
           "type": "string",
-          "default": "riscv32-unknown-elf-gdb",
+          "default": "riscv-none-elf-gdb",
           "description": "GDB executable for RISC-V."
         },
         "mikroDesign.addr2linePath": {
           "type": "string",
-          "default": "riscv32-unknown-elf-addr2line",
+          "default": "riscv-none-elf-addr2line",
           "description": "addr2line executable for mapping PC to source."
         },
         "mikroDesign.gdbPort": {
@@ -329,45 +376,15 @@
           "default": "",
           "description": "Assertion JSON file used for assist or enforce mode."
         },
-        "mikroDesign.assertPromptOnDebug": {
-          "type": "boolean",
-          "default": true,
-          "description": "Prompt to select or create an assert file when starting rv32sim."
-        },
-        "mikroDesign.assertShowAsm": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable --assert-asm to show disassembly around MMIO accesses."
-        },
-        "mikroDesign.assertVerbose": {
-          "type": "boolean",
-          "default": false,
-          "description": "Enable --assert-verbose to show full field detail/enums."
-        },
         "mikroDesign.assertWrites": {
           "type": "boolean",
           "default": false,
           "description": "Enable --assert-writes to prompt/assert on MMIO writes."
         },
-        "mikroDesign.assertAutoPrompt": {
-          "type": "boolean",
-          "default": true,
-          "description": "Automatically show assert UI when an MMIO assert occurs."
-        },
-        "mikroDesign.assertShowPanel": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show the Assert Helper panel when an MMIO assert occurs."
-        },
         "mikroDesign.assertAutoApplyRecommendation": {
           "type": "boolean",
           "default": false,
-          "description": "Automatically apply the recommended assert choice when available."
-        },
-        "mikroDesign.assertTraceAutoShow": {
-          "type": "boolean",
-          "default": true,
-          "description": "Automatically show the Assert Trace panel when an MMIO assert occurs."
+          "description": "Automatically apply recommended assert response when an MMIO prompt appears."
         },
         "mikroDesign.assertTraceMaxEntries": {
           "type": "number",
@@ -383,6 +400,11 @@
           "type": "boolean",
           "default": true,
           "description": "Stop at entry when starting the debug session."
+        },
+        "mikroDesign.debugUiVerbose": {
+          "type": "boolean",
+          "default": true,
+          "description": "Log detailed debug action traffic (step/continue/pause/restart/stop and adapter events) to the Mikro Design output panel."
         }
       }
     },
@@ -402,8 +424,13 @@
     ]
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "compile": "node esbuild.mjs",
+    "compile:tsc": "tsc --noEmit",
+    "compile:production": "node esbuild.mjs --production",
+    "watch": "node esbuild.mjs --watch",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "package": "vsce package",
     "pretest:puppeteer": "npm run compile",
     "test:puppeteer": "node ./scripts/puppeteer-test.mjs",
@@ -416,7 +443,14 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "esbuild": "^0.23.0",
+    "eslint": "^9.0.0",
     "puppeteer-core": "^23.9.0",
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^2.0.0"
   }
 }

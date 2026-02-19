@@ -3,4 +3,8 @@ out/
 .tmp/
 .pytest_cache/
 .claude/
+coverage/
 *.log
+*.vsix
+workbench.action.debug.*
+Mikro:

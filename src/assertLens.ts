@@ -6,6 +6,47 @@ import { Rv32SimController } from "./rv32simController";
 import { resolveToolchainBin } from "./sdkBuild";
 import { getWorkspaceRoot, resolvePath } from "./utils";
 
+/**
+ * Given a 0-based line number that may point to an empty or whitespace-only
+ * line, return the nearest line that has non-whitespace content.  Searches
+ * up to ±maxOffset lines.  Returns the original line if no non-empty
+ * neighbour is found.
+ *
+ * `lineText(i)` must return the text content of line `i`, or undefined if
+ * `i` is out of range (< 0 or >= lineCount).
+ */
+export function nudgeToCode(
+  line: number,
+  lineCount: number,
+  lineText: (i: number) => string | undefined,
+  maxOffset = 5,
+): number {
+  if (line < 0 || line >= lineCount) {
+    return Math.max(0, Math.min(line, lineCount - 1));
+  }
+  const text = lineText(line);
+  if (text !== undefined && text.trim()) {
+    return line;
+  }
+  for (let offset = 1; offset <= maxOffset; offset++) {
+    const up = line - offset;
+    if (up >= 0) {
+      const t = lineText(up);
+      if (t !== undefined && t.trim()) {
+        return up;
+      }
+    }
+    const down = line + offset;
+    if (down < lineCount) {
+      const t = lineText(down);
+      if (t !== undefined && t.trim()) {
+        return down;
+      }
+    }
+  }
+  return line;
+}
+
 export class AssertCodeLensProvider implements vscode.CodeLensProvider {
   private readonly onDidChangeEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeCodeLenses = this.onDidChangeEmitter.event;
@@ -41,7 +82,12 @@ export class AssertCodeLensProvider implements vscode.CodeLensProvider {
     }
     const doc = await vscode.workspace.openTextDocument(location.uri);
     const editor = await vscode.window.showTextDocument(doc, { preview: false });
-    const range = new vscode.Range(location.line, 0, location.line, 0);
+    const line = nudgeToCode(
+      Math.min(location.line, doc.lineCount - 1),
+      doc.lineCount,
+      (i) => doc.lineAt(i).text,
+    );
+    const range = new vscode.Range(line, 0, line, 0);
     editor.selection = new vscode.Selection(range.start, range.end);
     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
   }
@@ -59,7 +105,15 @@ export class AssertCodeLensProvider implements vscode.CodeLensProvider {
     if (path.normalize(location.uri.fsPath) !== path.normalize(document.uri.fsPath)) {
       return [];
     }
-    const range = new vscode.Range(location.line, 0, location.line, 0);
+    // addr2line may resolve to an empty line (off-by-one from compiler debug
+    // info, macro expansion, etc.).  Nudge to the nearest non-empty line so the
+    // CodeLens is visible next to actual code.
+    const line = nudgeToCode(
+      Math.min(location.line, document.lineCount - 1),
+      document.lineCount,
+      (i) => document.lineAt(i).text,
+    );
+    const range = new vscode.Range(line, 0, line, 0);
     const lenses: vscode.CodeLens[] = [];
 
     // Main info codelens - click to focus panel
@@ -135,27 +189,15 @@ export class AssertCodeLensProvider implements vscode.CodeLensProvider {
       this.cachedLocation = resolvedByPc;
       return resolvedByPc;
     }
-    const fallbackLocation = async (): Promise<{ uri: vscode.Uri; line: number } | null> => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) {
-        return null;
-      }
-      const uri = editor.document.uri;
-      const line = editor.selection.active.line;
-      this.cachedKey = key;
-      this.cachedLocation = { uri, line };
-      return this.cachedLocation;
-    };
-
     if (!session) {
-      return fallbackLocation();
+      return null;
     }
 
     try {
       const threads = await session.customRequest("threads");
       const threadId = threads?.threads?.[0]?.id;
       if (!threadId) {
-        return fallbackLocation();
+        return null;
       }
       const stack = await session.customRequest("stackTrace", {
         threadId,
@@ -164,8 +206,8 @@ export class AssertCodeLensProvider implements vscode.CodeLensProvider {
       });
       const frame = stack?.stackFrames?.[0];
       const sourcePath = frame?.source?.path;
-      if (!sourcePath || frame?.line == null) {
-        return fallbackLocation();
+      if (!sourcePath || frame?.line === null || frame?.line === undefined) {
+        return null;
       }
       const framePath = path.normalize(sourcePath);
       const line = Math.max(0, Number(frame.line) - 1);
@@ -174,7 +216,7 @@ export class AssertCodeLensProvider implements vscode.CodeLensProvider {
       this.cachedLocation = { uri, line };
       return this.cachedLocation;
     } catch (err) {
-      return fallbackLocation();
+      return null;
     }
   }
 

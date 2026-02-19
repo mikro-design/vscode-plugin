@@ -1,4 +1,4 @@
-.PHONY: clean deps compile test test-hardcore preflight run chaos chaos-hardcore
+.PHONY: clean deps compile lint test test-unit test-coverage test-hardcore test-puppeteer test-puppeteer-matrix preflight run chaos chaos-hardcore integration test-controller fuzz test-all
 
 CODE ?= code
 VSCODE_USER_DIR ?= /tmp/vscode-user-clean
@@ -15,6 +15,15 @@ deps:
 compile:
 	npm run -s compile
 
+lint:
+	npm run -s lint
+
+test-unit:
+	npm run -s test
+
+test-coverage:
+	npm run -s test:coverage
+
 preflight:
 	@python3 -c "import socket,sys; code='''try:\\n    s1, s2 = socket.socketpair()\\n    s1.shutdown(socket.SHUT_WR)\\n    print(\"preflight ok\")\\nexcept Exception as exc:\\n    print(\"preflight failed:\", exc)\\n    sys.exit(1)\\n'''; exec(code)"
 
@@ -30,6 +39,41 @@ test-hardcore: preflight compile
 	PUPPETEER_UI_CHAOS_MAX_HARD_ERRORS=8 \
 	PUPPETEER_UI_CHAOS_REQUIRE_START_STOP=1 \
 	npm run -s test:puppeteer
+
+test-puppeteer: preflight compile
+	PUPPETEER_DEEP=1 \
+	ELECTRON_DISABLE_SANDBOX=1 \
+	PUPPETEER_FULL_RUN_RETRIES=2 \
+	PUPPETEER_SHUTDOWN_SHIM_MODE=$${PUPPETEER_SHUTDOWN_SHIM_MODE:-auto} \
+	npm run -s test:puppeteer
+
+test-puppeteer-matrix: preflight compile
+	@set -e; \
+	for mode in off auto on; do \
+		echo "=== MODE $$mode ==="; \
+		for i in 1 2; do \
+			echo "--- run $$i (mode=$$mode) ---"; \
+			PUPPETEER_DEEP=1 \
+			ELECTRON_DISABLE_SANDBOX=1 \
+			PUPPETEER_FULL_RUN_RETRIES=2 \
+			PUPPETEER_SHUTDOWN_SHIM_MODE=$$mode \
+			npm run -s test:puppeteer || true; \
+		done; \
+	done
+
+test-controller: compile
+	npx vitest run src/test/controllerIntegration.test.ts src/test/miParserFuzz.test.ts
+
+fuzz: compile
+	node ./scripts/adapter-fuzz.mjs
+
+test-all: test-unit integration assert-integration fuzz
+
+integration: compile
+	node ./scripts/adapter-integration.mjs
+
+assert-integration: compile
+	node ./scripts/assert-integration.mjs
 
 chaos: compile
 	node ./scripts/adapter-chaos.mjs
@@ -68,4 +112,5 @@ run: clean deps compile
 		--no-sandbox \
 		--user-data-dir "$$U" \
 		--extensions-dir "$$E" \
-		--extensionDevelopmentPath "$(CURDIR)"
+		--extensionDevelopmentPath "$(CURDIR)" \
+		"$(CURDIR)"

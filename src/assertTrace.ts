@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as crypto from "crypto";
 import { AssertPrompt, AssertDecision } from "./assertPrompt";
 
 export type AssertRecommendation = { action: string; reason: string; input?: string } | null;
@@ -126,7 +127,6 @@ export class AssertTraceStore {
 export class AssertTracePanel implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | null = null;
   private messageDisposable: vscode.Disposable | null = null;
-  private revealInFlight = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -140,7 +140,6 @@ export class AssertTracePanel implements vscode.WebviewViewProvider {
       this.messageDisposable = null;
     }
     this.view = null;
-    this.revealInFlight = false;
   }
 
   resolveWebviewView(
@@ -198,18 +197,8 @@ export class AssertTracePanel implements vscode.WebviewViewProvider {
       this.view.show(true);
       return;
     }
-    if (this.revealInFlight) {
-      return;
-    }
-    this.revealInFlight = true;
-    void vscode.commands.executeCommand("mikroDesign.assertTrace.focus").then(
-      () => {
-        this.revealInFlight = false;
-      },
-      () => {
-        this.revealInFlight = false;
-      }
-    );
+    // Don't use executeCommand("...focus") — it steals cursor focus from the editor.
+    // The panel will render when the user opens the sidebar or VS Code resolves the view.
   }
 
   refresh(): void {
@@ -357,10 +346,18 @@ export class AssertTracePanel implements vscode.WebviewViewProvider {
 
           const head = document.createElement("div");
           head.className = "head";
-          head.innerHTML =
-            '<span class="kind">' + entry.type.toUpperCase() + '</span>' +
-            '<span class="target">' + (entry.register || entry.peripheral || ("0x" + entry.addr.toString(16))) + '</span>' +
-            '<span class="time">' + formatTime(entry.time) + '</span>';
+          const kindSpan = document.createElement("span");
+          kindSpan.className = "kind";
+          kindSpan.textContent = entry.type.toUpperCase();
+          const targetSpan = document.createElement("span");
+          targetSpan.className = "target";
+          targetSpan.textContent = entry.register || entry.peripheral || ("0x" + entry.addr.toString(16));
+          const timeSpan = document.createElement("span");
+          timeSpan.className = "time";
+          timeSpan.textContent = formatTime(entry.time);
+          head.appendChild(kindSpan);
+          head.appendChild(targetSpan);
+          head.appendChild(timeSpan);
           container.appendChild(head);
 
           const meta = document.createElement("div");
@@ -430,10 +427,5 @@ export class AssertTracePanel implements vscode.WebviewViewProvider {
 }
 
 function getNonce(): string {
-  let text = "";
-  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 32; i++) {
-    text += possible.charAt(Math.floor(Math.random() * possible.length));
-  }
-  return text;
+  return crypto.randomBytes(24).toString("base64url");
 }

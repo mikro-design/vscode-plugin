@@ -7,6 +7,65 @@ import { resolvePath, getWorkspaceRoot } from "./utils";
 
 export type AssertMode = "none" | "assist" | "enforce";
 
+/** Check if a write prompt should be auto-replied (writes disabled). */
+export function shouldAutoReply(
+  prompt: { type: string; addr: number; size: number; pc: number; rawLines: string[] },
+  allowWriteAsserts: boolean,
+): { reply: boolean } {
+  if (prompt.type !== "write" || allowWriteAsserts) {
+    return { reply: false };
+  }
+  const ready = prompt.rawLines.some(
+    (line) => line.includes("[ASSERT] Write expect") || line.includes("[ASSERT] Value:")
+  );
+  return { reply: ready };
+}
+
+/** Buffer text and extract complete lines containing [ASSERT].
+ *  Returns lines to log and remaining buffer. */
+export function extractAssertLines(
+  existingBuffer: string,
+  newText: string
+): { lines: string[]; buffer: string } {
+  const lines: string[] = [];
+  let buf = existingBuffer + newText;
+  let idx = buf.indexOf("\n");
+  while (idx >= 0) {
+    const line = buf.slice(0, idx).replace(/\r$/, "");
+    buf = buf.slice(idx + 1);
+    if (line.includes("[ASSERT]")) {
+      lines.push(line);
+    }
+    idx = buf.indexOf("\n");
+  }
+  // Flush partial lines that look like assert prompts
+  if (
+    buf &&
+    !buf.includes("\n") &&
+    (buf.includes("[ASSERT] Read value") ||
+      buf.includes("[ASSERT] Write expect") ||
+      buf.includes("[ASSERT] MMIO"))
+  ) {
+    lines.push(buf.replace(/\r$/, ""));
+    buf = "";
+  }
+  return { lines, buffer: buf };
+}
+
+export function sanitizeAssertValue(input: string): string {
+  let firstLine = String(input ?? "")
+    .replace(/\r/g, "")
+    .split("\n", 1)[0]
+    .trim();
+  if (!firstLine) {
+    return "";
+  }
+  if (firstLine.startsWith("[ASSERT]")) {
+    return "";
+  }
+  return firstLine;
+}
+
 export interface StartOptions {
   rv32simPath: string;
   pythonPath: string;
@@ -40,7 +99,6 @@ export class Rv32SimController {
   private onAssertResponseEmitter = new vscode.EventEmitter<{ prompt: AssertPrompt | null; response: string }>();
   readonly onAssertResponse = this.onAssertResponseEmitter.event;
   private allowWriteAsserts = false;
-  private lastAutoWriteReplyKey: string | null = null;
 
   constructor(private readonly output: vscode.OutputChannel) {
     const workspaceRoot = getWorkspaceRoot();
@@ -51,15 +109,21 @@ export class Rv32SimController {
       this.simLogPath = path.join(workspaceRoot, ".mikro-sim.log");
     }
     this.parser = new AssertPromptParser((prompt) => {
-      if (prompt && this.shouldAutoReplyWritePrompt(prompt) && this.proc) {
-        const fallback = prompt.value ?? "0x0";
-        this.output.appendLine(`[SIM] Auto-reply write assert with ${fallback} (writes disabled)`);
-        this.appendSimLog(`[SIM] Auto-reply write assert with ${fallback} (writes disabled)\n`);
-        this.proc.stdin.write(`${fallback}\n`);
-        this.onAssertResponseEmitter.fire({ prompt, response: fallback });
-        this.prompt = null;
-        this.parser.clear();
-        this.onPromptEmitter.fire(null);
+      // When write assertions are disabled, suppress all write prompts from the UI.
+      // Auto-reply when the prompt is ready; otherwise just swallow it silently
+      // so CodeLens and panels never see write prompts.
+      if (prompt && prompt.type === "write" && !this.allowWriteAsserts) {
+        if (this.isWritePromptReady(prompt) && this.proc) {
+          const fallback = prompt.value ?? "0x0";
+          this.output.appendLine(`[SIM] Auto-reply write assert with ${fallback} (writes disabled)`);
+          this.appendSimLog(`[SIM] Auto-reply write assert with ${fallback} (writes disabled)\n`);
+          this.proc.stdin.write(`${fallback}\n`);
+          this.onAssertResponseEmitter.fire({ prompt, response: fallback });
+          this.prompt = null;
+          this.parser.clear();
+          this.onPromptEmitter.fire(null);
+        }
+        // Don't set as currentPrompt — write prompts are invisible when disabled
         return;
       }
       this.prompt = prompt;
@@ -81,7 +145,6 @@ export class Rv32SimController {
     }
     this.stopRequested = false;
     this.allowWriteAsserts = options.assertWrites;
-    this.lastAutoWriteReplyKey = null;
     this.simStartMs = Date.now();
     this.lastIoMs = this.simStartMs;
     this.lastHeartbeatMs = 0;
@@ -161,7 +224,9 @@ export class Rv32SimController {
     if (options.assertVerbose) {
       args.push("--assert-verbose");
     }
-    // Keep assertions read-only in extension flows; do not pass --assert-writes.
+    if (options.assertWrites && options.assertMode !== "none") {
+      args.push("--assert-writes");
+    }
 
     const commandIsPython = rv32simPath.endsWith(".py");
     const command = commandIsPython ? options.pythonPath : rv32simPath;
@@ -230,6 +295,7 @@ export class Rv32SimController {
       this.appendSimLog(`[SIM] Closed code=${code ?? "unknown"} signal=${signal ?? "none"}\n`);
     });
 
+    const spawnedProc = this.proc;
     this.proc.on("exit", (code, signal) => {
       const now = Date.now();
       const uptimeMs = this.simStartMs > 0 ? now - this.simStartMs : 0;
@@ -241,10 +307,12 @@ export class Rv32SimController {
         `\n[SIM] Exited code=${code ?? "unknown"} signal=${signal ?? "none"} requestedStop=${this.stopRequested} uptimeMs=${uptimeMs} idleMs=${idleMs}\n`
       );
       this.clearHealthTimer();
-      this.proc = null;
-      this.prompt = null;
-      this.lastAutoWriteReplyKey = null;
-      this.onPromptEmitter.fire(null);
+      // Only clear state if this is still the active process (a new start() may have replaced it)
+      if (this.proc === spawnedProc) {
+        this.proc = null;
+        this.prompt = null;
+        this.onPromptEmitter.fire(null);
+      }
     });
   }
 
@@ -320,22 +388,10 @@ export class Rv32SimController {
     this.sendAssertResponse(fallback);
   }
 
-  private shouldAutoReplyWritePrompt(prompt: AssertPrompt): boolean {
-    if (prompt.type !== "write" || this.allowWriteAsserts) {
-      return false;
-    }
-    const ready = prompt.rawLines.some(
+  private isWritePromptReady(prompt: AssertPrompt): boolean {
+    return prompt.rawLines.some(
       (line) => line.includes("[ASSERT] Write expect") || line.includes("[ASSERT] Value:")
     );
-    if (!ready) {
-      return false;
-    }
-    const key = `${prompt.type}:${prompt.addr}:${prompt.size}:${prompt.pc}`;
-    if (this.lastAutoWriteReplyKey === key) {
-      return false;
-    }
-    this.lastAutoWriteReplyKey = key;
-    return true;
   }
 
   private verifyRv32Sim(command: string, commandIsPython: boolean, rv32simPath: string): boolean {
@@ -378,34 +434,14 @@ export class Rv32SimController {
     if (!this.assertLogPath) {
       return;
     }
-    this.assertLogBuffer += text;
-    let idx = this.assertLogBuffer.indexOf("\n");
-    while (idx >= 0) {
-      const line = this.assertLogBuffer.slice(0, idx).replace(/\r$/, "");
-      this.assertLogBuffer = this.assertLogBuffer.slice(idx + 1);
-      if (line.includes("[ASSERT]")) {
-        try {
-          fs.appendFileSync(this.assertLogPath, `${line}\n`);
-        } catch {
-          // ignore log failures
-        }
-      }
-      idx = this.assertLogBuffer.indexOf("\n");
-    }
-    if (
-      this.assertLogBuffer &&
-      !this.assertLogBuffer.includes("\n") &&
-      (this.assertLogBuffer.includes("[ASSERT] Read value") ||
-        this.assertLogBuffer.includes("[ASSERT] Write expect") ||
-        this.assertLogBuffer.includes("[ASSERT] MMIO"))
-    ) {
-      const line = this.assertLogBuffer.replace(/\r$/, "");
+    const result = extractAssertLines(this.assertLogBuffer, text);
+    this.assertLogBuffer = result.buffer;
+    for (const line of result.lines) {
       try {
         fs.appendFileSync(this.assertLogPath, `${line}\n`);
       } catch {
         // ignore log failures
       }
-      this.assertLogBuffer = "";
     }
   }
 
@@ -426,23 +462,7 @@ export class Rv32SimController {
   }
 
   private sanitizeAssertInput(input: string): string {
-    let firstLine = String(input ?? "")
-      .replace(/\r/g, "")
-      .split("\n", 1)[0]
-      .trim();
-    if (!firstLine) {
-      return "";
-    }
-    // Guard against accidental log-line pastes into the assert prompt.
-    if (firstLine.startsWith("[ASSERT]")) {
-      return "";
-    }
-    // Normalize decision strings like "0x0 PIN=0x1" to CSV form expected by assert parser.
-    const valueWithFields = firstLine.match(/^(0x[0-9a-fA-F]+|\d+)\s+([A-Za-z_][A-Za-z0-9_]*=.+)$/);
-    if (valueWithFields) {
-      firstLine = `${valueWithFields[1]},${valueWithFields[2]}`;
-    }
-    return firstLine;
+    return sanitizeAssertValue(input);
   }
 
   private installHealthTimer(): void {

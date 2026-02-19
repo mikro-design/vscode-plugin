@@ -7,13 +7,15 @@ import { Rv32SimController } from "./rv32simController";
 import { autoConfigureFromActiveEditor, buildFirmware, ensureBuildInfo, resolveBuildInfo, resolveToolchainBin } from "./sdkBuild";
 import { resolvePath } from "./utils";
 import { deriveMemRegionsFromElf } from "./memMap";
-import { configureAssertSettings } from "./assertConfig";
+import { autoCreateAssertFileIfNeeded } from "./assertConfig";
+import { createGdbServer, GdbServerType, GdbServerConfig } from "./gdbServer";
 
 interface MikroDebugConfiguration extends vscode.DebugConfiguration {
   mikroDesign?: boolean;
 }
 
 let lastKnownRv32simPath: string | undefined;
+let lastKnownRv32simWorkspace: string | undefined;
 
 export class MikroDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
   constructor(
@@ -38,7 +40,7 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
     _folder: vscode.WorkspaceFolder | undefined,
     config: MikroDebugConfiguration
   ): Promise<MikroDebugConfiguration | null | undefined> {
-    const log = createLogger();
+    const log = createLogger(this.output);
     log("resolveDebugConfiguration start");
     const isMikroConfig = config.mikroDesign || config.name?.startsWith("Mikro: rv32sim");
     if (!isMikroConfig) {
@@ -54,7 +56,6 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
     await autoConfigureFromActiveEditor(this.output).catch(() => undefined);
     const configSettings = vscode.workspace.getConfiguration();
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const sdkPath = resolvePath(configSettings.get<string>("mikroDesign.sdkPath"), workspaceRoot);
     if (this.sim.isRunning) {
       log("rv32sim already running; stopping before new debug launch");
       this.sim.stop();
@@ -69,7 +70,9 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
     log(`autoConfigureFromActiveEditor done gdbMmioReads=${gdbMmioReads} strictMode=${strictMode}`);
 
     const buildOnDebug = configSettings.get<boolean>("mikroDesign.buildOnDebug") ?? true;
-    if (buildOnDebug) {
+    const configuredElf = resolvePath(configSettings.get<string>("mikroDesign.elfPath"));
+    const hasReadyElf = Boolean(configuredElf && fs.existsSync(configuredElf));
+    if (buildOnDebug && !hasReadyElf) {
       const info = await buildFirmware(this.output);
       if (!info) {
         log("build failed");
@@ -81,15 +84,28 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
         vscode.ConfigurationTarget.Workspace
       );
       log(`build ok, elfPath=${info.elfPath}`);
+    } else if (buildOnDebug && hasReadyElf) {
+      log(`build skipped: ready elfPath=${configuredElf}`);
     }
 
     const buildInfo = resolveBuildInfo(this.output) ?? (await ensureBuildInfo(this.output));
+    const configuredElfPath = resolvePath(configSettings.get<string>("mikroDesign.elfPath"));
+    log(`buildInfo: ${buildInfo ? `sdkPath=${buildInfo.sdkPath} elfPath=${buildInfo.elfPath}` : "<none>"}`);
+    log(`configuredElfPath: ${configuredElfPath ?? "<none>"} exists=${configuredElfPath ? fs.existsSync(configuredElfPath) : false}`);
+    let sdkPathForResolve = buildInfo?.sdkPath;
     if (!buildInfo) {
-      log("buildInfo missing");
-      return null;
+      if (!configuredElfPath || !fs.existsSync(configuredElfPath)) {
+        log("buildInfo missing and no valid elfPath configured — cannot start debug session");
+        vscode.window.showErrorMessage(
+          "No ELF file configured. Run 'Mikro: Setup Project (SDK)' or set mikroDesign.elfPath. Check the \"Mikro Design\" output panel for details."
+        );
+        return null;
+      }
+      log(`buildInfo missing; using ELF-only debug mode elfPath=${configuredElfPath}`);
+      sdkPathForResolve = workspaceRoot ?? path.dirname(configuredElfPath);
     }
 
-    const elfPath = resolvePath(configSettings.get<string>("mikroDesign.elfPath")) ?? buildInfo.elfPath;
+    const elfPath = configuredElfPath ?? buildInfo?.elfPath;
     const configuredRv32sim = configSettings.get<string>("mikroDesign.rv32simPath");
     log(`rv32simPath from config: ${configuredRv32sim}`);
     let rv32simResolved: string | undefined;
@@ -103,7 +119,7 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
       rv32simResolved = resolveRv32simPath(
         configuredRv32sim ?? "../rv32sim/rv32sim.py",
         workspaceRoot,
-        sdkPath,
+        sdkPathForResolve,
         this.extensionRoot
       );
       log(`rv32simPath resolved to: ${rv32simResolved}`);
@@ -116,50 +132,71 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
         }
       }
     }
-    if ((!rv32simResolved || !fs.existsSync(rv32simResolved)) && lastKnownRv32simPath && fs.existsSync(lastKnownRv32simPath)) {
+    if ((!rv32simResolved || !fs.existsSync(rv32simResolved)) && lastKnownRv32simPath && lastKnownRv32simWorkspace === workspaceRoot && fs.existsSync(lastKnownRv32simPath)) {
       rv32simResolved = lastKnownRv32simPath;
       log(`rv32simPath fallback from last-known-good: ${rv32simResolved}`);
     }
     log(`rv32simPath FINAL being passed to controller: ${rv32simResolved}`);
     if (!rv32simResolved || !fs.existsSync(rv32simResolved)) {
-      vscode.window.showErrorMessage(`rv32sim.py not found. Please set mikroDesign.rv32simPath to a valid path.`);
-      log(`rv32sim path validation failed: ${rv32simResolved}`);
+      log(`rv32sim path validation failed: tried ${rv32simResolved ?? "<none>"}`);
+      vscode.window.showErrorMessage(
+        `rv32sim.py not found at "${rv32simResolved ?? "<not set>"}". Set mikroDesign.rv32simPath in settings. Check the "Mikro Design" output panel for details.`
+      );
       return null;
     }
     lastKnownRv32simPath = rv32simResolved;
-    let gdbPath = configSettings.get<string>("mikroDesign.gdbPath") ?? "riscv32-unknown-elf-gdb";
+    lastKnownRv32simWorkspace = workspaceRoot;
+    let gdbPath = configSettings.get<string>("mikroDesign.gdbPath") ?? "riscv-none-elf-gdb";
+    log(`gdbPath from settings: ${gdbPath}`);
     if (!commandExists(gdbPath)) {
+      log(`gdbPath not found in PATH or as absolute: ${gdbPath}`);
       const toolchainBin = resolveToolchainBin();
+      log(`toolchainBin resolved to: ${toolchainBin ?? "<none>"}`);
       if (toolchainBin) {
-        const candidate = path.join(toolchainBin, "riscv32-unknown-elf-gdb");
-        if (fs.existsSync(candidate)) {
-          gdbPath = candidate;
+        for (const name of ["riscv-none-elf-gdb", "riscv32-unknown-elf-gdb"]) {
+          const candidate = path.join(toolchainBin, name);
+          log(`trying toolchain gdb candidate: ${candidate} exists=${fs.existsSync(candidate)}`);
+          if (fs.existsSync(candidate)) {
+            gdbPath = candidate;
+            break;
+          }
         }
       }
     }
     if (!commandExists(gdbPath)) {
-      vscode.window.showErrorMessage(`GDB not found: ${gdbPath}`);
-      log(`gdb not found: ${gdbPath}`);
+      log(`gdbPath still not found after toolchain check, trying PATH fallbacks`);
+      for (const fallback of ["riscv-none-elf-gdb", "riscv32-unknown-elf-gdb"]) {
+        const found = commandExists(fallback);
+        log(`PATH fallback ${fallback}: ${found ? "found" : "not found"}`);
+        if (found) {
+          gdbPath = fallback;
+          break;
+        }
+      }
+    }
+    if (!commandExists(gdbPath)) {
+      const pathVar = process.env.PATH ?? "";
+      log(`GDB not found. PATH=${pathVar}`);
+      log(`Set mikroDesign.gdbPath to the full path of your RISC-V GDB executable, or add its directory to PATH.`);
+      vscode.window.showErrorMessage(
+        `GDB not found: ${gdbPath}. Set mikroDesign.gdbPath in settings or ensure the RISC-V toolchain bin directory is in PATH. Check the "Mikro Design" output panel for details.`
+      );
       return null;
     }
+    log(`gdbPath FINAL: ${gdbPath}`);
     const configuredPort = configSettings.get<number>("mikroDesign.gdbPort") ?? 3333;
     let port = configuredPort;
     let gdbPort: number | string = port;
     let serverAddress = `localhost:${port}`;
-    const assertPromptOnDebug = configSettings.get<boolean>("mikroDesign.assertPromptOnDebug") ?? true;
-    const assertSuggestedPath = path.join(
-      path.dirname(elfPath),
-      `${path.basename(elfPath, ".elf")}.assert.json`
-    );
-    if (debugTarget === "rv32sim" && assertPromptOnDebug) {
-      await configureAssertSettings("prompt", { suggestedPath: assertSuggestedPath }).catch(() => undefined);
+    if (debugTarget === "rv32sim") {
+      await autoCreateAssertFileIfNeeded().catch(() => undefined);
     }
     let entryPoint: number | null = null;
     if (debugTarget === "rv32sim") {
       let runtimeConfig = vscode.workspace.getConfiguration();
       let assertMode = (runtimeConfig.get<string>("mikroDesign.assertMode") ?? "assist").toLowerCase();
       let assertFile = resolvePath(runtimeConfig.get<string>("mikroDesign.assertFile"));
-      let assertWrites = false;
+      let assertWrites = runtimeConfig.get<boolean>("mikroDesign.assertWrites") ?? false;
       const forceAssist = process.env.MIKRO_FORCE_ASSERT_ASSIST === "1";
       const forceWrites = process.env.MIKRO_FORCE_ASSERT_WRITES === "1";
       const forceAssertFileRaw = process.env.MIKRO_FORCE_ASSERT_FILE;
@@ -171,10 +208,11 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
       }
       if (forceAssist) {
         assertMode = "assist";
-        if (forceWrites) {
-          log("MIKRO_FORCE_ASSERT_WRITES ignored (writes are disabled; reads-only assertions)");
-        }
+        assertWrites = forceWrites || assertWrites;
         log("assertMode forced to assist via MIKRO_FORCE_ASSERT_ASSIST");
+      } else if (forceWrites) {
+        assertWrites = true;
+        log("assertWrites forced via MIKRO_FORCE_ASSERT_WRITES");
       }
       const assertEmpty = isAssertFileEmpty(assertFile);
       if (assertEmpty && assertMode === "enforce") {
@@ -192,25 +230,13 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
         assertMode = "assist";
         assertWrites = false;
       }
-      if (assertMode !== "none") {
-        await vscode.workspace.getConfiguration().update(
-          "mikroDesign.assertShowPanel",
-          true,
-          vscode.ConfigurationTarget.Workspace
-        );
-        await vscode.workspace.getConfiguration().update(
-          "mikroDesign.assertAutoPrompt",
-          true,
-          vscode.ConfigurationTarget.Workspace
-        );
-      }
       if (assertMode === "assist" && assertFile) {
         ensureAssertFileExists(assertFile);
       }
       const memRegionsSetting = configSettings.get<string[]>("mikroDesign.memRegions") ?? [];
       const toolchainBin = resolveToolchainBin();
-      const derivedMemRegions = deriveMemRegionsFromElf(elfPath, toolchainBin);
-      entryPoint = deriveEntryPointFromElf(elfPath, toolchainBin);
+      const derivedMemRegions = elfPath ? deriveMemRegionsFromElf(elfPath, toolchainBin) : [];
+      entryPoint = elfPath ? deriveEntryPointFromElf(elfPath, toolchainBin) : null;
       const memRegions = derivedMemRegions.length > 0 ? derivedMemRegions : memRegionsSetting;
       if (memRegions.length) {
         log(`memRegions=${memRegions.join(",")}`);
@@ -255,31 +281,64 @@ export class MikroDebugConfigurationProvider implements vscode.DebugConfiguratio
         memRegions,
         assertMode: assertMode as any,
         assertFile,
-        assertShowAsm: runtimeConfig.get<boolean>("mikroDesign.assertShowAsm") ?? true,
-        assertVerbose: runtimeConfig.get<boolean>("mikroDesign.assertVerbose") ?? false,
+        assertShowAsm: true,
+        assertVerbose: false,
         assertWrites,
       });
       log("rv32sim started");
-      const gdbReady = await waitForPort(port, 10000)
-        .then(() => true)
-        .catch(() => false);
+      const gdbReady = tcpBlocked
+        ? await waitForUnixSocket(String(gdbPort).replace(/^unix:/, ""), 10000)
+            .then(() => true)
+            .catch(() => false)
+        : await waitForPort(port, 10000)
+            .then(() => true)
+            .catch(() => false);
       if (!gdbReady) {
-        log("gdb port wait timed out");
+        log(tcpBlocked ? "gdb unix socket wait timed out" : "gdb port wait timed out");
         this.sim.stop();
         vscode.window.showErrorMessage(
-          "rv32sim did not open the GDB port in time. Debug start aborted. Check .mikro-sim.log for details."
+          tcpBlocked
+            ? "rv32sim did not open the GDB unix socket in time. Debug start aborted. Check .mikro-sim.log for details."
+            : "rv32sim did not open the GDB port in time. Debug start aborted. Check .mikro-sim.log for details."
         );
         return null;
       }
     } else {
-      log(`embedded target selected; skipping rv32sim start (gdb port ${port})`);
+      log(`non-rv32sim target selected: ${debugTarget} (gdb port ${port})`);
+      const serverTypeRaw = (config.serverType as string) ?? debugTarget;
+      const serverType: GdbServerType =
+        serverTypeRaw === "embedded" ? "external" : (serverTypeRaw as GdbServerType);
+      const serverConfig: GdbServerConfig = {
+        serverPath: config.serverPath as string | undefined,
+        serverArgs: config.serverArgs as string[] | undefined,
+        configFiles: config.configFiles as string[] | undefined,
+        device: config.device as string | undefined,
+        interface: config.interface as "swd" | "jtag" | undefined,
+        port,
+        hwBreakpointLimit: config.hwBreakpointLimit as number | undefined,
+      };
+      try {
+        const server = createGdbServer(serverType, serverConfig);
+        const result = await server.start();
+        serverAddress = result.serverAddress;
+        const caps = result.capabilities;
+        const postConnect = server.getPostConnectCommands();
+        const loadCmd = elfPath ? server.getLoadCommand(elfPath) : "load";
+        config._serverCapabilities = caps;
+        config._postConnectCommands = postConnect;
+        config._loadCommand = loadCmd;
+        config._gdbServer = server;
+        log(`server started: ${serverAddress} caps=${JSON.stringify(caps)}`);
+      } catch (err) {
+        log(`server start failed: ${String(err)}`);
+        vscode.window.showErrorMessage(`GDB server start failed: ${String(err)}`);
+        return null;
+      }
     }
 
-    const stopAtEntry = true;
-    if (configSettings.get<boolean>("mikroDesign.debugStopAtEntry") === false) {
-      log("debugStopAtEntry ignored: Mikro always stops at entry");
-    }
+    const stopAtEntry = configSettings.get<boolean>("mikroDesign.debugStopAtEntry") ?? true;
 
+    log(`launching: program=${elfPath ?? "<none>"} gdb=${gdbPath} server=${serverAddress} stopAtEntry=${stopAtEntry} entryPoint=${entryPoint !== null ? `0x${entryPoint.toString(16)}` : "auto"}`);
     return {
       ...config,
       request: "launch",
@@ -382,8 +441,8 @@ function deriveEntryPointFromElf(elfPath: string, toolchainBin?: string): number
   return null;
 }
 
-function waitForPort(port: number, timeoutMs: number): Promise<void> {
-  const net = require("net") as typeof import("net");
+async function waitForPort(port: number, timeoutMs: number): Promise<void> {
+  const net = await import("net");
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     let resolved = false;
@@ -431,18 +490,68 @@ function waitForPort(port: number, timeoutMs: number): Promise<void> {
   });
 }
 
-function createLogger(): (message: string) => void {
+async function waitForUnixSocket(socketPath: string, timeoutMs: number): Promise<void> {
+  const net = await import("net");
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    let resolved = false;
+    const tryConnect = () => {
+      if (resolved) {
+        return;
+      }
+      const socket = new net.Socket();
+      socket.setTimeout(500);
+      socket.once("connect", () => {
+        if (!resolved) {
+          resolved = true;
+          socket.destroy();
+          resolve();
+        }
+      });
+      socket.once("timeout", () => {
+        socket.destroy();
+        if (!resolved) {
+          retry();
+        }
+      });
+      socket.once("error", () => {
+        socket.destroy();
+        if (!resolved) {
+          retry();
+        }
+      });
+      socket.connect(socketPath);
+    };
+    const retry = () => {
+      if (resolved) {
+        return;
+      }
+      if (Date.now() >= deadline) {
+        if (!resolved) {
+          resolved = true;
+          reject(new Error(`Socket ${socketPath} did not open`));
+        }
+        return;
+      }
+      setTimeout(tryConnect, 250);
+    };
+    tryConnect();
+  });
+}
+
+function createLogger(output?: vscode.OutputChannel): (message: string) => void {
   const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!workspace) {
-    return () => undefined;
-  }
-  const logPath = path.join(workspace, ".mikro-debug.log");
+  const logPath = workspace ? path.join(workspace, ".mikro-debug.log") : null;
   return (message: string) => {
-    try {
-      const line = `${new Date().toISOString()} ${message}\n`;
-      fs.appendFileSync(logPath, line);
-    } catch {
-      // ignore
+    if (output) {
+      output.appendLine(`[Debug] ${message}`);
+    }
+    if (logPath) {
+      try {
+        fs.appendFileSync(logPath, `${new Date().toISOString()} ${message}\n`);
+      } catch {
+        // ignore
+      }
     }
   };
 }
@@ -495,7 +604,7 @@ function isAssertFileEmpty(assertFile?: string): boolean {
       return true;
     }
     const parsed = JSON.parse(raw);
-    if (parsed == null) {
+    if (parsed === null || parsed === undefined) {
       return true;
     }
     if (Array.isArray(parsed)) {
@@ -541,7 +650,7 @@ function resolveRv32simPath(
   sdkPath?: string,
   extensionRoot?: string
 ): string | undefined {
-  if (lastKnownRv32simPath && fs.existsSync(lastKnownRv32simPath)) {
+  if (lastKnownRv32simPath && lastKnownRv32simWorkspace === workspaceRoot && fs.existsSync(lastKnownRv32simPath)) {
     return lastKnownRv32simPath;
   }
   const envPath = process.env.MIKRO_RV32SIM_PATH;
@@ -563,16 +672,23 @@ function findRv32simCandidate(workspaceRoot?: string, sdkPath?: string, extensio
   const home = os.homedir();
   const directCandidates: string[] = [
     path.join(home, "work", "git", "rv32sim", "rv32sim.py"),
+    path.join(home, "work", "git", "rv32sim.py", "rv32sim.py"),
     path.join(home, "git", "rv32sim", "rv32sim.py"),
+    path.join(home, "git", "rv32sim.py", "rv32sim.py"),
     path.join(home, "work", "gitlab", "rv32sim", "rv32sim.py"),
+    path.join(home, "work", "gitlab", "rv32sim.py", "rv32sim.py"),
   ];
   if (sdkPath) {
     directCandidates.push(path.join(sdkPath, "..", "rv32sim", "rv32sim.py"));
+    directCandidates.push(path.join(sdkPath, "..", "rv32sim.py", "rv32sim.py"));
     directCandidates.push(path.join(sdkPath, "..", "..", "rv32sim", "rv32sim.py"));
+    directCandidates.push(path.join(sdkPath, "..", "..", "rv32sim.py", "rv32sim.py"));
   }
   if (extensionRoot) {
     directCandidates.push(path.join(extensionRoot, "..", "rv32sim", "rv32sim.py"));
+    directCandidates.push(path.join(extensionRoot, "..", "rv32sim.py", "rv32sim.py"));
     directCandidates.push(path.join(extensionRoot, "..", "..", "rv32sim", "rv32sim.py"));
+    directCandidates.push(path.join(extensionRoot, "..", "..", "rv32sim.py", "rv32sim.py"));
   }
   for (const candidate of directCandidates) {
     if (fs.existsSync(candidate)) {
@@ -586,11 +702,17 @@ function findRv32simCandidate(workspaceRoot?: string, sdkPath?: string, extensio
   for (let depth = 0; depth < 12; depth += 1) {
     const candidates = [
       path.join(current, "rv32sim", "rv32sim.py"),
+      path.join(current, "rv32sim.py", "rv32sim.py"),
       path.join(current, "git", "rv32sim", "rv32sim.py"),
+      path.join(current, "git", "rv32sim.py", "rv32sim.py"),
       path.join(current, "gitlab", "rv32sim", "rv32sim.py"),
+      path.join(current, "gitlab", "rv32sim.py", "rv32sim.py"),
       path.resolve(current, "..", "rv32sim", "rv32sim.py"),
+      path.resolve(current, "..", "rv32sim.py", "rv32sim.py"),
       path.resolve(current, "..", "git", "rv32sim", "rv32sim.py"),
+      path.resolve(current, "..", "git", "rv32sim.py", "rv32sim.py"),
       path.resolve(current, "..", "gitlab", "rv32sim", "rv32sim.py"),
+      path.resolve(current, "..", "gitlab", "rv32sim.py", "rv32sim.py"),
     ];
     for (const candidate of candidates) {
       if (fs.existsSync(candidate)) {

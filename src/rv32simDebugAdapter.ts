@@ -688,10 +688,22 @@ class Rv32SimDebugAdapter {
       this.sendEvent("continued", { threadId: this.defaultThreadId, allThreadsContinued: true });
       return;
     }
+    if (this.syntheticStop) {
+      // GDB already considers the target running — don't send -exec-continue
+      // (it would fail with "Selected thread is running").  Transition to
+      // running state.  A real *stopped will arrive via MI async events when
+      // the target eventually stops (e.g. after assert stdin is answered, or
+      // a breakpoint is hit).  No poll needed — avoids a MI command storm.
+      this.log("continue during syntheticStop: transitioning to running (no poll)");
+      this.isRunning = true;
+      this.syntheticStop = false;
+      this.sendResponse(request, true, { allThreadsContinued: true });
+      this.sendEvent("continued", { threadId: this.defaultThreadId, allThreadsContinued: true });
+      return;
+    }
     try {
       await this.sendMiCommand("-exec-continue");
       this.isRunning = true;
-      this.syntheticStop = false;
       this.sendResponse(request, true, { allThreadsContinued: true });
       this.sendEvent("continued", { threadId: this.defaultThreadId, allThreadsContinued: true });
     } catch (err) {
@@ -730,7 +742,15 @@ class Rv32SimDebugAdapter {
       this.sendResponse(request, true);
       return;
     }
-    this.syntheticStop = false;
+    if (this.syntheticStop) {
+      // GDB thinks the target is running — clear the flag and attempt
+      // interrupt+step via the existing recovery path below.  If the
+      // interrupt succeeds, the retry will issue the actual step command.
+      // If it fails (e.g. target blocked on assert stdin), the recovery
+      // will force another synthetic stop so the UI stays responsive.
+      this.log(`step during syntheticStop: cmd=${command}, clearing flag for interrupt recovery`);
+      this.syntheticStop = false;
+    }
     const pcBefore = await this.readPc();
     this.log(`step begin cmd=${command} pcBefore=${pcBefore !== null ? `0x${pcBefore.toString(16)}` : "n/a"}`);
     try {

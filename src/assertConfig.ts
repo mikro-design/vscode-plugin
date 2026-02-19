@@ -133,7 +133,7 @@ export async function configureAssertSettings(
 
   const enforcedPath = enforceInBuildDir(assertPath, buildDir);
   if (enforcedPath !== assertPath) {
-    vscode.window.showInformationMessage(`Copied assert file to build folder: ${enforcedPath}`);
+    vscode.window.showInformationMessage(`Assert file copied from ${assertPath} to build folder: ${enforcedPath}`);
   }
   await updateConfig("mikroDesign.assertFile", enforcedPath);
   const assertIsEmpty = isAssertFileEmpty(enforcedPath);
@@ -172,7 +172,88 @@ function enforceInBuildDir(assertPath: string, buildDir: string): string {
   return dest;
 }
 
-function isAssertFileEmpty(assertPath: string): boolean {
+export async function runAssertWizard(): Promise<string | null> {
+  const config = vscode.workspace.getConfiguration();
+  const elfPathRaw = config.get<string>("mikroDesign.elfPath") ?? "";
+  const workspaceRoot = getWorkspaceRoot();
+  const elfPath = resolvePath(elfPathRaw, workspaceRoot);
+
+  let assertFilePath: string;
+  if (elfPath && fs.existsSync(elfPath)) {
+    const dir = path.dirname(elfPath);
+    const base = path.basename(elfPath, ".elf");
+    assertFilePath = path.join(dir, `${base}.assert.json`);
+  } else {
+    const sdkPathRaw = config.get<string>("mikroDesign.sdkPath") ?? "";
+    const root = resolvePath(sdkPathRaw, workspaceRoot) ?? workspaceRoot;
+    if (!root) {
+      vscode.window.showWarningMessage("Open a workspace before setting up assert testing.");
+      return null;
+    }
+    assertFilePath = path.join(root, "build", "assertions.json");
+  }
+
+  await vscode.window.showInformationMessage(
+    `Assert testing will create an assertion file at:\n${assertFilePath}\n\nMMIO accesses will be prompted during debug sessions.`,
+    "OK"
+  );
+
+  const dir = path.dirname(assertFilePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  if (!fs.existsSync(assertFilePath)) {
+    fs.writeFileSync(assertFilePath, JSON.stringify({ assertions: {} }, null, 2) + "\n", "utf8");
+  }
+
+  await updateConfig("mikroDesign.assertMode", "assist");
+  await updateConfig("mikroDesign.assertFile", assertFilePath);
+
+  vscode.window.showInformationMessage(`Assert file ready: ${assertFilePath}`);
+  return assertFilePath;
+}
+
+export async function autoCreateAssertFileIfNeeded(): Promise<string | null> {
+  const config = vscode.workspace.getConfiguration();
+  const assertMode = (config.get<string>("mikroDesign.assertMode") ?? "assist").toLowerCase();
+  if (assertMode === "none") {
+    return null;
+  }
+  const existingFile = config.get<string>("mikroDesign.assertFile") ?? "";
+  if (existingFile) {
+    const resolved = resolvePath(existingFile, getWorkspaceRoot());
+    if (resolved && fs.existsSync(resolved)) {
+      return resolved;
+    }
+  }
+
+  const elfPathRaw = config.get<string>("mikroDesign.elfPath") ?? "";
+  const workspaceRoot = getWorkspaceRoot();
+  const elfPath = resolvePath(elfPathRaw, workspaceRoot);
+  if (!elfPath) {
+    return null;
+  }
+
+  const dir = path.dirname(elfPath);
+  const base = path.basename(elfPath, ".elf");
+  const assertFilePath = path.join(dir, `${base}.assert.json`);
+
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  if (!fs.existsSync(assertFilePath)) {
+    fs.writeFileSync(assertFilePath, JSON.stringify({ assertions: {} }, null, 2) + "\n", "utf8");
+  }
+
+  await updateConfig("mikroDesign.assertFile", assertFilePath);
+  if (!assertMode || assertMode === "none") {
+    await updateConfig("mikroDesign.assertMode", "assist");
+  }
+
+  return assertFilePath;
+}
+
+export function isAssertFileEmpty(assertPath: string): boolean {
   try {
     if (!fs.existsSync(assertPath)) {
       return true;
@@ -182,7 +263,7 @@ function isAssertFileEmpty(assertPath: string): boolean {
       return true;
     }
     const parsed = JSON.parse(raw);
-    if (parsed == null) {
+    if (parsed === null || parsed === undefined) {
       return true;
     }
     if (Array.isArray(parsed)) {

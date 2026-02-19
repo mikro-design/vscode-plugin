@@ -148,6 +148,9 @@ export class AssertPromptParser {
       return null;
     }
     const left = clean.slice(0, arrowIndex).trim();
+    // Extract just the numeric value — field annotations like "PIN=0x1" are display-only
+    const inputMatch = left.match(/^(0x[0-9a-fA-F]+|\d+)/);
+    const input = inputMatch ? inputMatch[1] : left;
     let right = clean.slice(arrowIndex + 2).trim();
     let note: string | undefined;
     const noteStart = right.lastIndexOf("(");
@@ -166,7 +169,7 @@ export class AssertPromptParser {
       }
     }
     return {
-      input: left,
+      input,
       target: right,
       targetPc,
       targetAsm,
@@ -176,6 +179,7 @@ export class AssertPromptParser {
   }
 
   clear(): void {
+    this.buffer = "";
     this.current = null;
     this.inDecision = false;
   }
